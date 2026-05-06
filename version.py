@@ -17,11 +17,18 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.24.0"
+APP_VERSION = "1.24.1"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.24.1", "2026-05-06", [
+            "[Fix] PAC reimport now writes replacement mesh normals during same-topology in-place rebuilds, preventing stale donor custom normals from causing dark, flipped, or sticker-like lighting patches on imported OBJ/FBX meshes.",
+            "[Fix] PAC rebuild can clear donor shading records and packed-normal high flags when requested, so replacement meshes can keep their own normal data cleanly.",
+            "[Feature] Explorer search now supports quoted phrases, OR/NOT clauses, wildcards, field filters such as `ext:`, `name:`, `path:`, `type:`, `size:`, and optional `content:` byte search while keeping the simple search path fast.",
+        ],
+    ),
     (
         "1.24.0", "2026-05-04", [
             "[Feature] Catalog Browser collapses the iteminfo / multichange leveling-variant clones. Pearl Abyss's tables describe each item once as a base record (`variant_level=None`) and once per upgrade level — a single Canta Plate Cloak ships in the catalog as a base plus +1 through +30, all sharing the same PAC, icon and shader and differing only in a `(+N)` suffix on the display name. Showing all 19,692 raw rows in the grid was pure noise; the dialog now folds them down to 4,320 unique items by keeping every record whose `variant_level is None` plus any rare orphan whose base doesn't ship as a record. Result: the canta search returns 4 distinct items (Canta Plate Armor, Canta Plate Cloak, Cantars Leather Armor, Eccanta Plate Armor) instead of 50, and `Rhett's Longsword` shows once instead of 30 times.",

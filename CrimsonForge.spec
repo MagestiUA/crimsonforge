@@ -144,7 +144,7 @@ a = Analysis(
         'ui.dialogs.pabc_viewer_dialog',
         'ui.dialogs.confirmation',
         'ui.dialogs.file_picker',
-        'ui.preview_pane',
+        'ui.widgets.preview_pane',
         # Utils
         'utils.config',
         'utils.logger',
