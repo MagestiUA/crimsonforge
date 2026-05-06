@@ -149,3 +149,299 @@ def match(query: str, *corpora: str) -> bool:
         if not any(ct.startswith(qt) for ct in corpus):
             return False
     return True
+
+
+# ───────────────────────────────────────────────────────────────────
+# Enterprise query parser — boolean operators, phrases, fields,
+# wildcards. Used by the Explorer's advanced search.
+# ───────────────────────────────────────────────────────────────────
+
+# Field qualifiers we recognise (case-insensitive).
+_KNOWN_FIELDS = {"ext", "name", "path", "content", "size", "type"}
+
+
+class Clause:
+    """A single search clause: one of phrase / token / wildcard / field.
+
+    Attributes:
+        kind: 'phrase', 'token', 'wildcard', 'field'
+        value: the literal text (lowercased for case-insensitive)
+        field: only set for kind='field' — the field name
+        negated: if True, this clause MUST NOT match
+    """
+    __slots__ = ("kind", "value", "field", "negated")
+
+    def __init__(self, kind: str, value: str, field: str = "", negated: bool = False):
+        self.kind = kind
+        self.value = value
+        self.field = field
+        self.negated = negated
+
+    def __repr__(self) -> str:
+        n = "!" if self.negated else ""
+        if self.field:
+            return f"{n}{self.field}:{self.value}"
+        return f"{n}<{self.kind}:{self.value}>"
+
+
+class ParsedQuery:
+    """A parsed query: list of OR'd groups, each group is AND of clauses.
+
+    For example, the query ``canta plate OR mace AND ambition``
+    parses to two AND-groups:
+
+        [[canta, plate], [mace, ambition]]
+
+    A row matches when ANY group matches (i.e., when ALL clauses in
+    that group match). Negated clauses (``-eccanta`` or ``NOT eccanta``)
+    must NOT match for the group to qualify.
+
+    Empty query → matches everything.
+    """
+    __slots__ = ("groups", "raw")
+
+    def __init__(self, groups: list[list[Clause]], raw: str = ""):
+        self.groups = groups
+        self.raw = raw
+
+    def is_empty(self) -> bool:
+        return not self.groups or all(not g for g in self.groups)
+
+    def needs_content(self) -> bool:
+        """Return True if any clause uses field='content' — these are slow."""
+        return any(c.field == "content" for g in self.groups for c in g)
+
+
+def _scan_query(text: str) -> list[str]:
+    """Tokenize a query string preserving phrases and operators.
+
+    Splits on whitespace but respects double-quoted phrases as single
+    tokens. Operators (``AND``, ``OR``, ``NOT``) survive as separate
+    tokens. Field-qualified values like ``ext:.dds`` stay glued.
+    """
+    tokens: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c == '"' or c == "'":
+            quote = c
+            j = i + 1
+            while j < n and text[j] != quote:
+                j += 1
+            tokens.append(text[i:j + 1] if j < n else text[i:])
+            i = j + 1
+        else:
+            j = i
+            # Read until next whitespace, but allow ":" mid-token for fields
+            while j < n and not text[j].isspace():
+                # Special: stop at quote that starts a value (field:"value")
+                j += 1
+            tokens.append(text[i:j])
+            i = j
+    return tokens
+
+
+def parse_query(text: str) -> ParsedQuery:
+    """Parse an enterprise search query into ``ParsedQuery``.
+
+    Syntax:
+        token              — prefix-matched against name/path tokens
+        "exact phrase"     — substring match (kept verbatim, lowercased)
+        *.dds / cd_phm_*   — fnmatch glob (any token containing * or ?)
+        ext:.dds           — extension filter
+        name:hel_0363      — filename-only substring
+        path:character     — path-only substring
+        content:bytes      — search inside file contents (slow)
+        size:>1mb          — file size > 1 MiB
+        size:<500kb        — file size < 500 KiB
+        AND / (space)      — both must match (default)
+        OR                 — either matches (creates a new AND-group)
+        NOT foo / -foo     — negate the next clause
+    """
+    if not text or not text.strip():
+        return ParsedQuery([], raw=text or "")
+
+    raw_tokens = _scan_query(text)
+    groups: list[list[Clause]] = [[]]
+    pending_negation = False
+
+    for tok in raw_tokens:
+        if not tok:
+            continue
+        upper = tok.upper()
+        if upper == "OR":
+            if groups[-1]:
+                groups.append([])
+            continue
+        if upper == "AND":
+            continue  # default semantics; ignore the keyword
+        if upper == "NOT":
+            pending_negation = True
+            continue
+        negated = pending_negation
+        pending_negation = False
+
+        if tok.startswith("-") and len(tok) > 1:
+            negated = True
+            tok = tok[1:]
+
+        clause = _make_clause(tok, negated)
+        if clause is None:
+            continue
+        groups[-1].append(clause)
+
+    # Drop empty trailing groups (e.g. user typed "foo OR ")
+    groups = [g for g in groups if g]
+    return ParsedQuery(groups, raw=text)
+
+
+def _make_clause(tok: str, negated: bool) -> Clause | None:
+    """Convert one raw token into a Clause."""
+    if not tok:
+        return None
+
+    # Quoted phrase: "exact" or 'exact'
+    if (len(tok) >= 2 and tok[0] in '"\'' and tok[-1] == tok[0]):
+        inner = tok[1:-1]
+        if not inner:
+            return None
+        return Clause("phrase", inner.lower(), negated=negated)
+
+    # Field qualifier: foo:bar
+    if ":" in tok:
+        head, _, tail = tok.partition(":")
+        head_l = head.lower()
+        if head_l in _KNOWN_FIELDS and tail:
+            # Strip surrounding quotes from the value
+            if len(tail) >= 2 and tail[0] in '"\'' and tail[-1] == tail[0]:
+                tail = tail[1:-1]
+            return Clause("field", tail.lower(), field=head_l, negated=negated)
+
+    # Wildcard token
+    if "*" in tok or "?" in tok:
+        return Clause("wildcard", tok.lower(), negated=negated)
+
+    # Plain token — case-insensitive prefix match against tokens
+    return Clause("token", tok.lower(), negated=negated)
+
+
+def _size_to_bytes(spec: str) -> int | None:
+    """Parse '1mb', '500kb', '2gb', '100' (bytes) into integer bytes."""
+    spec = spec.strip().lower()
+    if not spec:
+        return None
+    units = {"kb": 1024, "k": 1024, "mb": 1024 ** 2, "m": 1024 ** 2,
+             "gb": 1024 ** 3, "g": 1024 ** 3, "b": 1, "": 1}
+    for u in sorted(units, key=len, reverse=True):
+        if spec.endswith(u):
+            num_part = spec[:-len(u)] if u else spec
+            try:
+                return int(float(num_part) * units[u])
+            except ValueError:
+                return None
+    return None
+
+
+def evaluate_clause(clause: Clause, *, name: str, path: str,
+                    ext: str, tokens: set[str], extra: str,
+                    size: int = 0, type_desc: str = "",
+                    content_loader=None) -> bool:
+    """Evaluate a single clause against a row's data.
+
+    All inputs (except size and content_loader) should already be
+    lowercased for the case-insensitive match.
+
+    ``content_loader`` is a zero-arg callable returning the file's
+    raw bytes. Only invoked when the clause requires content search,
+    so the hot path stays cheap.
+    """
+    import fnmatch as _fn
+    val = clause.value
+    fld = clause.field
+    kind = clause.kind
+
+    if kind == "phrase":
+        ok = val in path or val in extra or val in name
+        return ok != clause.negated
+
+    if kind == "wildcard":
+        target_path = path
+        target_name = name
+        ok = _fn.fnmatch(target_path, val) or _fn.fnmatch(target_name, val)
+        return ok != clause.negated
+
+    if kind == "field":
+        if fld == "ext":
+            wanted = val if val.startswith(".") else f".{val}"
+            return (ext == wanted) != clause.negated
+        if fld == "name":
+            return (val in name) != clause.negated
+        if fld == "path":
+            return (val in path) != clause.negated
+        if fld == "type":
+            return (val in type_desc.lower()) != clause.negated
+        if fld == "size":
+            op = ">"
+            num_str = val
+            if val.startswith((">=", "<=")):
+                op = val[:2]
+                num_str = val[2:]
+            elif val[:1] in "><":
+                op = val[0]
+                num_str = val[1:]
+            limit = _size_to_bytes(num_str)
+            if limit is None:
+                return not clause.negated  # malformed → permissive
+            ok = (op == ">"  and size >  limit) or \
+                 (op == "<"  and size <  limit) or \
+                 (op == ">=" and size >= limit) or \
+                 (op == "<=" and size <= limit)
+            return ok != clause.negated
+        if fld == "content":
+            if content_loader is None:
+                return False  # caller didn't supply loader → no match
+            try:
+                data = content_loader()
+            except Exception:
+                return clause.negated
+            ok = val.encode("utf-8", "ignore") in data
+            return ok != clause.negated
+        return not clause.negated  # unknown field — permissive
+
+    # token: prefix-match against any token in the corpus
+    if kind == "token":
+        for ct in tokens:
+            if ct.startswith(val):
+                return not clause.negated
+        # Fall back to substring on extra — covers raw paths users paste
+        if val in path or val in extra:
+            return not clause.negated
+        return clause.negated
+
+    return not clause.negated
+
+
+def match_query(parsed: ParsedQuery, *, name: str, path: str,
+                ext: str, tokens: set[str], extra: str,
+                size: int = 0, type_desc: str = "",
+                content_loader=None) -> bool:
+    """Match a row against a ``ParsedQuery``.
+
+    Returns True if ANY OR-group fully matches (all its clauses
+    evaluate True). Empty query matches everything.
+    """
+    if parsed.is_empty():
+        return True
+    for group in parsed.groups:
+        if not group:
+            continue
+        if all(evaluate_clause(c, name=name, path=path, ext=ext,
+                               tokens=tokens, extra=extra, size=size,
+                               type_desc=type_desc, content_loader=content_loader)
+               for c in group):
+            return True
+    return False

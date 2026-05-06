@@ -135,6 +135,93 @@ class _ArchiveRow:
         return self._type_desc
 
 
+def _match_complex_query(parsed, row, content_loader=None) -> bool:
+    """Evaluate a multi-clause / boolean / field / wildcard query against ``row``.
+
+    Hot-path fast: tokens use substring (not tokenization), so each
+    keystroke stays C-fast even for the full 1.4 M-row corpus. Field
+    qualifiers, wildcards, and phrases delegate to ``evaluate_clause``
+    which already does the right thing without per-row tokenization.
+    """
+    import fnmatch as _fn
+
+    name_lower = os.path.basename(row.path_lower)
+    path_lower = row.path_lower
+    extra_lower = row.search_extra
+    ext_lower = row.ext
+    size = row.size_raw
+
+    for group in parsed.groups:
+        if not group:
+            continue
+        ok = True
+        for c in group:
+            val = c.value
+            kind = c.kind
+            fld = c.field
+
+            if kind == "token":
+                # Substring on path/extra/name — no tokenization.
+                hit = (val in path_lower
+                       or (extra_lower and val in extra_lower)
+                       or val in name_lower)
+            elif kind == "phrase":
+                hit = (val in path_lower
+                       or (extra_lower and val in extra_lower)
+                       or val in name_lower)
+            elif kind == "wildcard":
+                hit = _fn.fnmatch(path_lower, val) or _fn.fnmatch(name_lower, val)
+            elif kind == "field":
+                if fld == "ext":
+                    wanted = val if val.startswith(".") else f".{val}"
+                    hit = ext_lower == wanted
+                elif fld == "name":
+                    hit = val in name_lower
+                elif fld == "path":
+                    hit = val in path_lower
+                elif fld == "type":
+                    hit = val in (row.type_desc.lower() if row._type_desc is not None else "")
+                elif fld == "size":
+                    op = ">"
+                    num_str = val
+                    if val.startswith((">=", "<=")):
+                        op = val[:2]; num_str = val[2:]
+                    elif val[:1] in "><":
+                        op = val[0]; num_str = val[1:]
+                    limit = text_search._size_to_bytes(num_str)
+                    if limit is None:
+                        hit = True
+                    else:
+                        hit = ((op == ">"  and size >  limit)
+                               or (op == "<"  and size <  limit)
+                               or (op == ">=" and size >= limit)
+                               or (op == "<=" and size <= limit))
+                elif fld == "content":
+                    if content_loader is None:
+                        hit = False
+                    else:
+                        try:
+                            data = content_loader()
+                            hit = val.encode("utf-8", "ignore") in data
+                        except Exception:
+                            hit = False
+                else:
+                    hit = True
+            else:
+                hit = True
+
+            if c.negated:
+                hit = not hit
+
+            if not hit:
+                ok = False
+                break
+
+        if ok:
+            return True
+    return False
+
+
 class _ArchiveModel(QAbstractTableModel):
     """Virtual model for archive file list. Only visible rows are rendered.
 
@@ -149,6 +236,12 @@ class _ArchiveModel(QAbstractTableModel):
         self._ext_set: set = set()
         self._search_text = ""
         self._scoped_paths: set[str] | None = None
+        # VFS handle — only needed when the user runs a ``content:`` query.
+        # The parent tab calls ``set_vfs`` after archive load completes.
+        self._vfs = None
+
+    def set_vfs(self, vfs) -> None:
+        self._vfs = vfs
 
     def set_data(self, rows: list[_ArchiveRow]):
         self.beginResetModel()
@@ -173,7 +266,6 @@ class _ArchiveModel(QAbstractTableModel):
         self.endResetModel()
 
     def _refilter(self):
-        import fnmatch as _fn
         ext_set = self._ext_set
         search = self._search_text
         scoped_paths = self._scoped_paths
@@ -181,47 +273,48 @@ class _ArchiveModel(QAbstractTableModel):
             self._filtered = list(range(len(self._all_rows)))
             return
 
-        # Parse search: support wildcards and ext: prefix
+        # Bare-extension shortcut: ``.dds`` (no space) or ``ext:.dds``
+        # (no space after value) → super-fast path. Anything more complex
+        # ("ext:.dds canta", ".dds canta") falls through to the parser.
         search_ext = ""
-        search_text = search
-        if search.startswith("ext:"):
-            # ext:.dds or ext:dds
+        if search.startswith("ext:") and " " not in search:
             search_ext = search[4:].strip()
             if search_ext and not search_ext.startswith("."):
                 search_ext = "." + search_ext
-            search_text = ""
+            search = ""
         elif search.startswith(".") and " " not in search and len(search) < 15:
-            # Typing just ".dds" filters by extension
             search_ext = search
-            search_text = ""
+            search = ""
 
-        use_glob = "*" in search_text or "?" in search_text
+        # Parse remaining query into the enterprise form.
+        parsed = text_search.parse_query(search)
+        needs_content = parsed.needs_content()
 
-        # Two-tier matching for non-glob queries, designed for the
-        # 1.4 M-row hot loop:
-        #   Tier A — token match against row.search_display only.
-        #     Most rows have empty search_display (no item alias attached)
-        #     so this is a cheap ``if not row.search_display: skip``.
-        #     The few thousand rows that DO have a display alias get a
-        #     lazily-cached token set so subsequent keystrokes reuse the
-        #     work.
-        #   Tier B — plain substring match against path_lower and
-        #     search_extra. This is the same C-fast ``in`` check the
-        #     pre-1.24.0 filter used and is what keeps the loop under one
-        #     frame per keystroke on real hardware. Tier A's purpose is
-        #     to suppress false-positive Tier B hits for English item-
-        #     name queries (the canta-plate-armor-vs-eccanta case);
-        #     Tier B's purpose is to stay fast for raw-path queries.
-        # If any row qualifies for Tier A we return only Tier A so
-        # 'canta plate armor' resolves to just the chest piece's files
-        # without the eccanta / cantarts substring noise. Otherwise we
-        # fall through to Tier B and surface every substring hit.
+        # Detect the "simple single token" case so we keep the v1.24.0
+        # Tier A / Tier B fast path. Anything richer (booleans, fields,
+        # wildcards, phrases, multiple tokens) goes through the parsed
+        # evaluator — but with substring semantics, no per-row tokenization
+        # of the 1.4 M-path corpus.
+        is_simple_prefix = (
+            len(parsed.groups) == 1
+            and len(parsed.groups[0]) == 1
+            and parsed.groups[0][0].kind == "token"
+            and not parsed.groups[0][0].negated
+        )
+
         tier_a: list[int] = []
         tier_b: list[int] = []
-        token_query = bool(search_text) and not use_glob
-        # Tokenize the query exactly once per filter pass; per-row
-        # display-token sets are lazily cached on the row itself.
-        q_tokens = text_search.tokenize(search_text) if token_query else []
+        all_hits: list[int] = []
+        simple_token = (
+            parsed.groups[0][0].value if is_simple_prefix else ""
+        )
+        simple_q_tokens = [simple_token] if simple_token else []
+
+        # Pre-compute the cheap stuff the complex-query evaluator needs.
+        # ``content_loader`` is built lazily per row only when the query
+        # actually contains a content: clause, so the hot path stays
+        # O(n) in row count, not O(n×m) where m is path length.
+        vfs = self._vfs
 
         for i, row in enumerate(self._all_rows):
             if scoped_paths is not None and row.path_lower not in scoped_paths:
@@ -230,42 +323,39 @@ class _ArchiveModel(QAbstractTableModel):
                 continue
             if search_ext and row.ext != search_ext:
                 continue
-            if search_text:
-                if use_glob:
-                    if not (
-                        _fn.fnmatch(row.path_lower, search_text)
-                        or (row.search_extra and _fn.fnmatch(row.search_extra, search_text))
-                    ):
-                        continue
-                    tier_b.append(i)
-                else:
-                    # Tier A: display-name token match (only for rows
-                    # that actually have a display alias — typically
-                    # well under 1% of the 1.4 M corpus).
-                    if row.search_display and text_search.match_prefilter(
-                        q_tokens, row._get_display_tokens()
-                    ):
-                        tier_a.append(i)
-                        continue
-                    # Tier B: plain substring fallback — same hot-path
-                    # cost as the pre-1.24.0 filter. ``search_extra``
-                    # already carries both the original CamelCase and the
-                    # lowercased form of every alias term (see
-                    # ``core.item_index.build_item_index``), so this match
-                    # works case-insensitively without needing a ``.lower()``
-                    # call per row per keystroke.
-                    if search_text in row.path_lower or (
-                        row.search_extra and search_text in row.search_extra
-                    ):
-                        tier_b.append(i)
-                    continue
-            else:
+            if parsed.is_empty():
                 tier_b.append(i)
+                continue
 
-        if token_query and tier_a:
+            if is_simple_prefix:
+                # Tier A — display alias prefix match (only ~1% of rows
+                # have a display alias, so this is mostly a no-op skip).
+                if row.search_display and text_search.match_prefilter(
+                    simple_q_tokens, row._get_display_tokens()
+                ):
+                    tier_a.append(i)
+                    continue
+                # Tier B — same C-fast substring as pre-1.24.0.
+                if simple_token in row.path_lower or (
+                    row.search_extra and simple_token in row.search_extra
+                ):
+                    tier_b.append(i)
+                continue
+
+            # Complex query path — substring semantics on tokens (no
+            # per-row tokenization), full match for fields/wildcards/phrases.
+            content_loader = None
+            if needs_content and vfs is not None:
+                content_loader = lambda r=row: vfs.read_entry_data(r.entry)
+            if _match_complex_query(parsed, row, content_loader):
+                all_hits.append(i)
+
+        if all_hits:
+            self._filtered = all_hits
+        elif is_simple_prefix and tier_a:
             self._filtered = tier_a
         else:
-            self._filtered = tier_a + tier_b if token_query else tier_b
+            self._filtered = tier_a + tier_b
 
     def row_at(self, view_row: int) -> _ArchiveRow:
         if 0 <= view_row < len(self._filtered):
@@ -450,18 +540,11 @@ class ExplorerTab(QWidget):
         toolbar.addWidget(QLabel("Search:"))
         self._search_input = SearchHistoryLineEdit(self._config, "explorer")
         self._search_input.setPlaceholderText(
-            "Search files or item names: Vow of the Dead King, *.dds, ext:.pam..."
+            'e.g. canta plate armor   "exact phrase"   *.dds   ext:.pam   '
+            'name:hel_0363   -eccanta   canta OR mace   size:>1mb'
         )
-        self._search_input.setToolTip(
-            "Search files or item names by name or pattern:\n"
-            "  Vow of the Dead King - related PAC/prefab/model files\n"
-            "  sword         — files containing 'sword'\n"
-            "  *.dds         — wildcard glob pattern\n"
-            "  *armor*sword* — multiple wildcards\n"
-            "  .pam          — filter by extension\n"
-            "  ext:.dds      — explicit extension filter\n"
-            "Case-insensitive."
-        )
+        self._search_input.setMinimumWidth(560)
+        self._search_input.setToolTip(self._build_search_tooltip())
         self._search_input.textChanged.connect(lambda _: self._search_timer.start())
         toolbar.addWidget(self._search_input, 1)
 
@@ -486,6 +569,23 @@ class ExplorerTab(QWidget):
         )
         self._catalog_btn.clicked.connect(self._open_catalog_browser)
         toolbar.addWidget(self._catalog_btn)
+
+        # Search-syntax help button — small icon button next to Catalog.
+        # Click opens a popup with the full enterprise search syntax
+        # cheatsheet so users discover boolean operators, field
+        # qualifiers, wildcards, and content-search without staring
+        # at a tooltip.
+        self._search_help_btn = QPushButton()
+        self._search_help_btn.setIcon(self.style().standardIcon(
+            QStyle.StandardPixmap.SP_FileDialogDetailedView
+        ))
+        self._search_help_btn.setFixedWidth(32)
+        self._search_help_btn.setToolTip(
+            "Search syntax cheatsheet — click to view all operators "
+            "(AND/OR/NOT, phrases, wildcards, field filters, content search)."
+        )
+        self._search_help_btn.clicked.connect(self._show_search_syntax_help)
+        toolbar.addWidget(self._search_help_btn)
 
         self._navigator_btn = QPushButton("Navigator")
         self._navigator_btn.setObjectName("primary")
@@ -659,6 +759,7 @@ class ExplorerTab(QWidget):
         self._item_index = None
         self._pending_scope_request = None
         self._active_scope_title = ""
+        self._model.set_vfs(vfs)
         self._model.set_scope_paths(None)
         self._update_scope_ui()
         self._load_item_index()
@@ -688,6 +789,7 @@ class ExplorerTab(QWidget):
         previous_group = self._group_combo.currentText()
         self._vfs = payload.vfs
         self._all_groups = list(payload.groups)
+        self._model.set_vfs(payload.vfs)
         # Reset only the caches that derive from game state —
         # the user's filter / search / scope stay in place.
         self._item_index = None
@@ -940,6 +1042,93 @@ class ExplorerTab(QWidget):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _build_search_tooltip(self) -> str:
+        """Compact tooltip for the search bar — full help is in the dialog."""
+        return (
+            "Type to search file names + item aliases.\n"
+            "  canta plate armor       all tokens (AND)\n"
+            "  \"exact phrase\"          quoted = exact substring\n"
+            "  canta OR mace           either matches\n"
+            "  -eccanta / NOT eccanta  exclude\n"
+            "  *.dds, cd_phm_*         wildcards\n"
+            "  ext:.dds                filter by extension\n"
+            "  name:hel_0363           filename only\n"
+            "  path:character          path only\n"
+            "  size:>1mb / size:<500kb size filter\n"
+            "  content:CD_PHM_00       search inside file bytes (slow)\n"
+            "Click the syntax-help button (next to Catalog) for examples."
+        )
+
+    def _show_search_syntax_help(self) -> None:
+        """Open a popup with the full enterprise search syntax cheatsheet."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QTextBrowser, QPushButton, QHBoxLayout
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Search syntax — Explorer")
+        dialog.resize(720, 560)
+        layout = QVBoxLayout(dialog)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml("""
+        <h2>Explorer search syntax</h2>
+        <p>The search bar accepts plain text plus a small enterprise query language.
+        Everything is case-insensitive. Multiple terms separated by spaces are
+        AND-ed together by default.</p>
+
+        <h3>Plain tokens</h3>
+        <table cellpadding="4">
+          <tr><td><code>canta</code></td><td>Files whose path or item alias contains a token starting with <code>canta</code>.</td></tr>
+          <tr><td><code>canta plate armor</code></td><td>All three tokens must match (default AND).</td></tr>
+          <tr><td><code>canta OR mace</code></td><td>Either matches.</td></tr>
+          <tr><td><code>-eccanta</code> &nbsp; or &nbsp; <code>NOT eccanta</code></td><td>Exclude rows containing <code>eccanta</code>.</td></tr>
+          <tr><td><code>canta NOT eccanta</code></td><td>Combine: must contain canta AND must not contain eccanta.</td></tr>
+        </table>
+
+        <h3>Phrases &amp; wildcards</h3>
+        <table cellpadding="4">
+          <tr><td><code>"canta plate armor"</code></td><td>Exact substring match (whitespace preserved).</td></tr>
+          <tr><td><code>*.dds</code></td><td>Glob: ends with <code>.dds</code>.</td></tr>
+          <tr><td><code>cd_phm_*</code></td><td>Glob: starts with <code>cd_phm_</code>.</td></tr>
+          <tr><td><code>*hel_0363*</code></td><td>Glob: contains <code>hel_0363</code> anywhere.</td></tr>
+          <tr><td><code>*_mg.dds</code></td><td>Glob: ends with <code>_mg.dds</code>.</td></tr>
+          <tr><td><code>?</code></td><td>Wildcard for a single char (fnmatch).</td></tr>
+        </table>
+
+        <h3>Field qualifiers</h3>
+        <table cellpadding="4">
+          <tr><td><code>ext:.dds</code></td><td>Files with the given extension. <code>.</code> optional.</td></tr>
+          <tr><td><code>name:hel_0363</code></td><td>Substring match in the file's basename only (not the path).</td></tr>
+          <tr><td><code>path:character/texture</code></td><td>Substring match in the directory path only.</td></tr>
+          <tr><td><code>type:image</code></td><td>Substring match in the file-type description (DDS Texture, PAC Mesh…).</td></tr>
+          <tr><td><code>size:&gt;1mb</code> &nbsp; or &nbsp; <code>size:&lt;500kb</code></td><td>Size filter. Units: <code>b</code>, <code>kb</code>, <code>mb</code>, <code>gb</code>. <code>&gt;= &lt;=</code> also accepted.</td></tr>
+          <tr><td><code>content:CD_PHM_00_Hel_0363</code></td><td>Search inside the file's <i>raw bytes</i>. Slow — only runs after the other filters narrow the corpus.</td></tr>
+        </table>
+
+        <h3>Combinations</h3>
+        <table cellpadding="4">
+          <tr><td><code>ext:.dds canta</code></td><td>All DDS files whose path/alias matches <code>canta</code>.</td></tr>
+          <tr><td><code>*.pac AND content:0x47</code></td><td>PAC files whose bytes contain <code>0x47</code>.</td></tr>
+          <tr><td><code>name:hel_0363 -inside</code></td><td>Files named <code>hel_0363*</code> excluding any with <code>inside</code> anywhere.</td></tr>
+          <tr><td><code>(canta OR mace) ambition</code></td><td>Parentheses are <i>not</i> grouped yet — but <code>canta ambition OR mace ambition</code> works.</td></tr>
+        </table>
+
+        <h3>Tips</h3>
+        <ul>
+          <li>Empty search shows everything (subject to other filters).</li>
+          <li>Tokens use prefix match: <code>canta</code> matches <code>cantarts</code> but not <code>eccanta</code> (token boundary required).</li>
+          <li>Item aliases (display names) are searched by token; raw paths are searched by substring — both happen automatically.</li>
+          <li>The <b>Catalog</b> button is for browsing items by category — same end result as typing the item's stem.</li>
+          <li><b>Content search</b> is on a per-file basis: each matching file is read, decompressed, and grep'd. Use it sparingly.</li>
+        </ul>
+        """)
+        layout.addWidget(browser)
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+        dialog.exec()
 
     def _open_catalog_browser(self):
         """Open the categorised image-grid item browser dialog.
