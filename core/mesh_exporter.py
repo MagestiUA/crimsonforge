@@ -1062,6 +1062,7 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
     inspected after the fact without reverse-engineering the binary.
     """
     from core.skeleton_parser import Skeleton
+    from core.mesh_parser import derive_skin_slot_to_pab_geometric
 
     os.makedirs(output_dir, exist_ok=True)
     base = name or Path(mesh.path).stem
@@ -1083,6 +1084,29 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
       f"{mesh.total_vertices} verts, {mesh.total_faces} faces")
     D(f"Skeleton: {len(skeleton.bones) if skeleton else 0} bones")
     D(f"Scale   : {scale}")
+
+    # ── GEOMETRIC SKIN RESOLUTION ──
+    # The PAC stores per-vertex skin influences as palette slot indices
+    # (not direct PAB bone indices). The per-mesh palette layout is
+    # incompletely reverse-engineered: neither direct PAB indexing nor
+    # PABC.records[slot] resolves to anatomically-correct bones (verified
+    # on Damian — both interpretations put a right-shoulder vert on a
+    # left-clavicle bone or on a foot bone). We resolve slot -> PAB by
+    # geometric centroid of the verts using each slot, which is robust
+    # to the encoding gap because the engine groups verts into a slot
+    # iff they share the same bone influence in the source rig.
+    if skeleton and skeleton.bones and any(sm.bone_indices for sm in mesh.submeshes):
+        # Detect whether the bone_indices already look like PAB indices
+        # (range 0..N-1 against skeleton size) or palette slots. If the
+        # max referenced index is in range and the per-submesh slot
+        # range is contiguous-looking, we still apply the geometric
+        # resolution because it costs nothing for already-correct meshes
+        # (verts cluster around the bone they're tagged to either way).
+        n_resolved = derive_skin_slot_to_pab_geometric(mesh, skeleton)
+        D("")
+        D(f"=== Geometric skin resolution ===")
+        D(f"Resolved {n_resolved} vertex-bone pairs to PAB indices "
+          f"via vertex-centroid -> nearest-bone matching.")
     D("")
     D("--- Per-submesh ---")
     for i, sm in enumerate(mesh.submeshes):
@@ -1544,6 +1568,7 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
             view_verts = view["verts"]
             view_faces = view["faces"]
             view_normals = view["normals"]
+            view_uvs = view["uvs"]   # 1:1 with view_verts via _filtered_submesh_view
 
             verts_flat = []
             for x, y, z in view_verts:
@@ -1559,7 +1584,20 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                 nvx, nvy, nvz = _yup_to_zup_vec3((nx, ny, nz))
                 normals_flat.extend([nvx, nvy, nvz])
 
-            def geom_node(b2, vf=verts_flat, iff=indices_flat, nf=normals_flat):
+            # UV emission. Layout matches the simple `export_fbx`
+            # baseline (verified working in Blender / Maya / Unreal):
+            # ByVertice + Direct, one (u, 1-v) pair per filtered
+            # vertex. The V-flip mirrors PA → DCC convention (PA
+            # stores UVs with V going top→bottom; FBX/glTF use
+            # bottom→top). Mapping is one-to-one with positions
+            # because `_filtered_submesh_view` keeps `f_uvs` in lock-
+            # step with `f_verts` (drops the same spike indices).
+            uvs_flat = []
+            for u, v in view_uvs:
+                uvs_flat.extend([u, 1.0 - v])
+
+            def geom_node(b2, vf=verts_flat, iff=indices_flat,
+                          nf=normals_flat, uf=uvs_flat):
                 def layer_elem_normal(b3, nf_=nf):
                     W(b3, "Version", [101])
                     W(b3, "Name", [""])
@@ -1567,17 +1605,33 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                     W(b3, "ReferenceInformationType", ["Direct"])
                     W(b3, "Normals", [nf_])
 
+                def layer_elem_uv(b3, uf_=uf):
+                    W(b3, "Version", [101])
+                    W(b3, "Name", ["UVMap"])
+                    W(b3, "MappingInformationType", ["ByVertice"])
+                    W(b3, "ReferenceInformationType", ["Direct"])
+                    W(b3, "UV", [uf_])
+
                 def layer0(b3):
                     W(b3, "Version", [100])
                     def le_normal(b4):
                         W(b4, "Type", ["LayerElementNormal"])
                         W(b4, "TypedIndex", [0])
                     W(b3, "LayerElement", children=[le_normal])
+                    if uf:
+                        def le_uv(b4):
+                            W(b4, "Type", ["LayerElementUV"])
+                            W(b4, "TypedIndex", [0])
+                        W(b3, "LayerElement", children=[le_uv])
 
                 W(b2, "Vertices", [vf])
                 W(b2, "PolygonVertexIndex", [iff])
                 if nf:
-                    W(b2, "LayerElementNormal", [0], children=[layer_elem_normal])
+                    W(b2, "LayerElementNormal", [0],
+                      children=[layer_elem_normal])
+                if uf:
+                    W(b2, "LayerElementUV", [0],
+                      children=[layer_elem_uv])
                 W(b2, "Layer", [0], children=[layer0])
 
             W(b, "Geometry", [mid, f"{sm.name}\x00\x01Geometry", "Mesh"],
@@ -1675,6 +1729,84 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                 else:
                     # Root bone: local == world.
                     local_bind_by_idx[bn.index] = list(w)
+
+            # ── PER-BONE VISUAL LENGTH (FBX LimbNode "Size") ──
+            #
+            # FBX stores bone visual length as the LimbNode NodeAttribute's
+            # ``Size`` scalar — measured along the bone's local Y axis.
+            # Without "Automatic Bone Orientation" on import (the default,
+            # and the option that preserves animation-export round-trip
+            # fidelity), Blender draws each bone's tail at
+            # ``head + Y_axis × Size``. So Size IS the visible bone length.
+            #
+            # Pre-2026-05-08 we wrote Size = 0.05 for every bone, which
+            # made finger leaves look as long as forearms. To get the
+            # natural anatomical proportions (fingers small, legs big)
+            # we compute Size as the world-space distance from each
+            # bone's bind position to its FIRST child's bind position.
+            # For leaf bones (no children) we fall back to half the
+            # parent's Size, so a finger tip is half the previous joint —
+            # matching the standard Maya/Max bone-tip convention.
+            #
+            # This is purely a VISUAL hint; it does NOT affect skinning
+            # (TransformLink carries the bind), animation curves (Lcl R
+            # carries pose), or the game-export round-trip (Pearl
+            # Abyss's PAB has no equivalent field).
+            from collections import defaultdict
+            children_by_parent: dict[int, list[int]] = defaultdict(list)
+            for _bn in skeleton.bones:
+                if _bn.parent_index is not None and _bn.parent_index >= 0:
+                    children_by_parent[_bn.parent_index].append(_bn.index)
+
+            bone_size_by_idx: dict[int, float] = {}
+            DEFAULT_LEAF_SIZE = 0.02 * scale  # 2cm if scale=1
+            # First pass: parents (have children → distance to first child)
+            for _bn in skeleton.bones:
+                children = children_by_parent.get(_bn.index, [])
+                if not children:
+                    continue
+                w = world_by_idx[_bn.index]
+                bx, by, bz = w[12], w[13], w[14]
+                dists: list[float] = []
+                for ci in children:
+                    cw = world_by_idx.get(ci)
+                    if not cw or len(cw) != 16:
+                        continue
+                    dx = cw[12] - bx
+                    dy = cw[13] - by
+                    dz = cw[14] - bz
+                    d = (dx * dx + dy * dy + dz * dz) ** 0.5
+                    if d > 1e-4:
+                        dists.append(d)
+                if dists:
+                    # Pick the LONGEST child distance — that's the
+                    # natural chain continuation. Bip01 bones in Crimson
+                    # Desert have lots of "twist" / "sub" / "front_dummy"
+                    # children clustered RIGHT NEXT to the parent (a
+                    # few centimeters away) plus one main-chain child
+                    # (e.g. Thigh → Calf is 35-45 cm). Using min() picks
+                    # the twist sub-bone and produces 3 cm forearms;
+                    # max() picks the real chain link and gives natural
+                    # anatomical proportions (forearm → hand 25 cm,
+                    # thigh → calf 40 cm).
+                    bone_size_by_idx[_bn.index] = max(dists) * scale
+
+            # Second pass: leaves (no children → half-parent or default)
+            for _bn in skeleton.bones:
+                if _bn.index in bone_size_by_idx:
+                    continue
+                p = _bn.parent_index
+                if p is not None and p >= 0 and p in bone_size_by_idx:
+                    bone_size_by_idx[_bn.index] = bone_size_by_idx[p] * 0.5
+                else:
+                    bone_size_by_idx[_bn.index] = DEFAULT_LEAF_SIZE
+            # Clamp to reasonable range so Blender's display doesn't pick
+            # up zero-length bones (fp underflow) or run-away gigantic
+            # ones from data anomalies.
+            for _i in list(bone_size_by_idx.keys()):
+                bone_size_by_idx[_i] = max(0.005 * scale,
+                                           min(bone_size_by_idx[_i],
+                                               2.0 * scale))
 
             # Debug — print Lcl TRS that will be written for first 6 bones
             D("")
@@ -1854,8 +1986,14 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                 # vertex toward origin via the inv(TransformLink) factor
                 # — exactly the symptom we're seeing.
                 def bone_attr(b2, bn=bone):
-                    def attr_props(b3):
-                        W(b3, "P", ["Size", "double", "Number", "", 0.05])
+                    # Per-bone visual length so fingers look small and
+                    # legs look big. See bone_size_by_idx computation
+                    # above (distance to first child / half-parent for
+                    # leaves). Pure visual hint — doesn't affect skin
+                    # math or game-export round-trip.
+                    sz = bone_size_by_idx.get(bn.index, 0.05)
+                    def attr_props(b3, _sz=sz):
+                        W(b3, "P", ["Size", "double", "Number", "", float(_sz)])
                     W(b2, "Properties70", children=[attr_props])
                     W(b2, "TypeFlags", ["Skeleton"])
                 W(b, "NodeAttribute", [bone_attr_ids[bone.index],
@@ -1929,7 +2067,11 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                         W(b3, "P", ["InheritType",   "enum", "",       "", 1])
                         W(b3, "P", ["RotationOrder", "enum", "",       "", 0])
                         W(b3, "P", ["RotationActive", "bool", "",      "", 1])
-                        W(b3, "P", ["Size", "double", "Number", "", 1.0])
+                        # Mirror the per-bone visual length here too —
+                        # some FBX importers prefer the Model's Size to
+                        # the NodeAttribute's. Both stay in sync.
+                        _model_sz = bone_size_by_idx.get(_bn.index, 1.0)
+                        W(b3, "P", ["Size", "double", "Number", "", float(_model_sz)])
                         W(b3, "P", ["Lcl Translation", "Lcl Translation", "", "A",
                                     tx, ty, tz])
                         # Direct Lcl R (NOT PreRotation). PreRotation = 0.

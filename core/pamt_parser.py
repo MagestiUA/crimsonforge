@@ -256,21 +256,65 @@ def find_file_entry(pamt_data: PamtData, filename: str) -> Optional[PamtFileEntr
     # Single pass with ordered preference. Exact-full-path matches
     # are the most specific, so they take precedence over
     # basename-only matches even when a less-specific basename
-    # match appears earlier in the entry list. We record the first
-    # basename-only candidate we see, but keep scanning in case a
-    # later entry is an exact-path match. This is NOT a fallback
-    # chain — it is a canonical priority rule: given two otherwise-
-    # valid matches, the more specific one wins.
-    basename_candidate: Optional[PamtFileEntry] = None
+    # match appears earlier in the entry list. We record the
+    # DEEPEST (longest-path) basename-only candidate we see — NOT
+    # the first one — because shipping PAMTs routinely contain
+    # both a SHORTCUT alias (e.g. ``character/cd_phm_00_hel_00_0363.pac``)
+    # AND the real nested entry (e.g. ``character/model/1_pc/1_phm/
+    # armor/13_hel/cd_phm_00_hel_00_0363.pac``) for the same
+    # basename. The shortcut tends to come first in the entry list,
+    # but the runtime loader uses the real nested path. Patching
+    # the shortcut updates an alias the game ignores → the mod
+    # silently doesn't show in-game (verified on helmet 0363,
+    # 2026-05-04). Choosing the longest path picks the canonical
+    # entry by construction; aliases are always shorter.
+    #
+    # This is NOT a fallback chain — it is a canonical priority
+    # rule: given two otherwise-valid matches, the deeper one wins.
+    best_basename: Optional[PamtFileEntry] = None
+    best_basename_depth = -1
     for entry in pamt_data.file_entries:
         epath = entry.path.replace("\\", "/").lower()
         if epath == needle:
             return entry
-        if basename_candidate is None:
-            ebase = epath.rsplit("/", 1)[-1]
-            if ebase == needle_base:
-                basename_candidate = entry
-    return basename_candidate
+        ebase = epath.rsplit("/", 1)[-1]
+        if ebase == needle_base:
+            depth = len(epath)
+            if depth > best_basename_depth:
+                best_basename = entry
+                best_basename_depth = depth
+    return best_basename
+
+
+def find_all_file_entries(
+    pamt_data: PamtData, filename: str,
+) -> list[PamtFileEntry]:
+    """Return EVERY entry in the PAMT whose canonical path or
+    basename matches the needle.
+
+    Companion to :func:`find_file_entry`. Where ``find_file_entry``
+    picks one canonical entry (the deepest match), this returns the
+    full list — useful for the repack UI's preview panel that shows
+    all candidate paths so the user can verify which one will be
+    patched, and for diagnostics like "this basename has 2 aliases
+    and 1 real entry".
+    """
+    if not filename or not pamt_data.file_entries:
+        return []
+    needle = filename.replace("\\", "/").lower()
+    needle_base = needle.rsplit("/", 1)[-1]
+    out: list[PamtFileEntry] = []
+    for entry in pamt_data.file_entries:
+        epath = entry.path.replace("\\", "/").lower()
+        if epath == needle:
+            out.append(entry)
+            continue
+        ebase = epath.rsplit("/", 1)[-1]
+        if ebase == needle_base:
+            out.append(entry)
+    # Deepest paths first — the canonical entry is the first item.
+    out.sort(key=lambda e: -len(e.path.replace("\\", "/")))
+    return out
 
 
 def update_pamt_paz_entry(

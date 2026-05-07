@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import struct
 from collections import Counter
@@ -636,6 +637,36 @@ def parse_iteminfo_records(vfs: VfsManager, equip_types: list[str]) -> list[Item
     data = vfs.read_entry_data(entry)
     pamt_0009 = vfs.load_pamt("0009")
     hash_table = build_hash_table(pamt_0009.file_entries)
+
+    # Real .pac stems present in the live PAMT, used to verify that a
+    # synthesised pac_name actually exists. See ``_resolve_pac_stems``
+    # below — without this check, items whose prefab hash resolves to a
+    # ``_index01_n.prefab`` descriptor get a fabricated ``_index01_n.pac``
+    # written into the catalog instead of the real bare-stem ``.pac`` /
+    # ``_sub01.pac`` files the engine actually loads.
+    real_pac_stems: set[str] = set()
+    for pac_entry in pamt_0009.file_entries:
+        ep = pac_entry.path.replace("\\", "/").lower()
+        if ep.endswith(".pac"):
+            real_pac_stems.add(os.path.splitext(os.path.basename(ep))[0])
+
+    # Suffix list ordered LONGEST-FIRST so compound forms like
+    # ``_index01_n`` strip cleanly to ``""``. Bare ``_n`` (normal-map
+    # prefab variant) and bare ``_index??`` come last.
+    SUFFIX_STRIP = (
+        "_index01_n", "_index02_n", "_index03_n",
+        "_index01", "_index02", "_index03",
+        "_l", "_r", "_u", "_s", "_t", "_n",
+    )
+
+    def _resolve_pac_stems(name: str) -> list[str]:
+        b = name
+        for sfx in SUFFIX_STRIP:
+            if b.endswith(sfx):
+                b = b[:-len(sfx)]
+                break
+        return [c for c in (b, b + "_sub01", b + "_sub02") if c in real_pac_stems]
+
     records: list[ItemCatalogRecord] = []
     seen_ids: set[int] = set()
     idx = 0
@@ -700,14 +731,10 @@ def parse_iteminfo_records(vfs: VfsManager, equip_types: list[str]) -> list[Item
             resolved = hash_table.get(prefab_hash)
             if not resolved:
                 continue
-            base = resolved
-            for suffix in ("_l", "_r", "_u", "_s", "_t", "_index01", "_index02", "_index03"):
-                if base.endswith(suffix):
-                    base = base[: -len(suffix)]
-                    break
-            pac_name = base + ".pac"
-            if pac_name not in pac_files:
-                pac_files.append(pac_name)
+            for stem in _resolve_pac_stems(resolved):
+                pac_name = stem + ".pac"
+                if pac_name not in pac_files:
+                    pac_files.append(pac_name)
 
         records.append(
             _finalize_record(
@@ -955,7 +982,7 @@ def build_item_catalog(vfs: VfsManager, progress_fn: PROGRESS_FN | None = None) 
 # version are silently rejected and rebuilt — users never see stale data
 # (e.g. empty display_name fields after the May 3 2026 0x0E -> 0x0F delimiter
 # fix) bleeding into a fresh launch.
-_PARSER_VERSION = "2026-05-04-iteminfo-0x0F+display-aliases+icon-paths+variant-inherit"
+_PARSER_VERSION = "2026-05-06-pac-stem-verify+_n-suffix"
 
 
 def build_item_catalog_cached(
@@ -1011,29 +1038,29 @@ def write_catalog_exports(data: ItemCatalogData, output_dir: str | Path) -> dict
     )
 
     with items_csv.open("w", encoding="utf-8-sig", newline="") as handle:
-        fieldnames = [
-            "source",
-            "item_id",
-            "loc_key",
-            "internal_name",
-            "variant_base_name",
-            "variant_level",
-            "top_category",
-            "category",
-            "subcategory",
-            "subsubcategory",
-            "raw_type",
-            "classification_source",
-            "classification_confidence",
-            "pac_files",
-            "prefab_hashes",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        # Build fieldnames from a sample item via dataclass asdict() so
+        # newly-added fields don't have to be mirrored here manually.
+        # Pre-2026-05-08 this list was hard-coded and got out of sync
+        # whenever a field was added to the dataclass — most recently
+        # ``display_name`` and ``icon_paths`` triggered
+        # ``ValueError: dict contains fields not in fieldnames``.
+        if data.items:
+            sample = asdict(data.items[0])
+            sample.pop("search_text", None)
+            fieldnames = list(sample.keys())
+        else:
+            fieldnames = ["item_id"]  # empty export still gets a header
+        writer = csv.DictWriter(handle, fieldnames=fieldnames,
+                                extrasaction="ignore")
         writer.writeheader()
         for item in data.items:
             row = asdict(item)
             row["pac_files"] = ";".join(item.pac_files)
-            row["prefab_hashes"] = ";".join(str(value) for value in item.prefab_hashes)
+            row["prefab_hashes"] = ";".join(str(v) for v in item.prefab_hashes)
+            # icon_paths is a list — flatten with the same separator.
+            icon_paths = row.get("icon_paths")
+            if isinstance(icon_paths, (list, tuple)):
+                row["icon_paths"] = ";".join(str(v) for v in icon_paths)
             row.pop("search_text", None)
             writer.writerow(row)
 

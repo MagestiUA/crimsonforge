@@ -53,6 +53,10 @@ class VfsManager:
         self._papgt_data: Optional[PapgtData] = None
         self._pamt_cache: dict[str, PamtData] = {}
         self._root = VfsNode(name="root", is_dir=True)
+        # Groups whose entries are cached but NOT yet inserted into the
+        # ``_root`` trie. ``get_tree`` drains this set on first access.
+        # See ``load_pamt`` for the rationale (cold-load perf win).
+        self._tree_dirty_groups: set[str] = set()
         self._logged_processing_warnings: set[tuple[str, str]] = set()
 
     def load_papgt(self) -> PapgtData:
@@ -90,8 +94,21 @@ class VfsManager:
         pamt_data = parse_pamt(str(pamt_path), paz_dir=paz_dir)
         self._pamt_cache[group_dir] = pamt_data
 
-        for entry in pamt_data.file_entries:
-            self._add_to_tree(entry, group_dir)
+        # ── PERF (2026-05-07) ──
+        # We previously called ``_add_to_tree`` for every PAMT entry to
+        # populate ``self._root``, a hierarchical VFS trie. Cold-load
+        # profiling found this added ~5 s during the parallel paloc
+        # scan (it had to allocate ~1.5 M VfsNode objects across all
+        # 34 groups, and the work serialised on the GIL even with 8
+        # threads). A repo-wide grep for ``get_tree``, ``vfs._root``,
+        # and ``VfsNode`` confirms NOTHING outside ``vfs_manager.py``
+        # consumes that trie — every real consumer iterates
+        # ``pamt.file_entries`` directly.
+        #
+        # We now mark the cache stale so the trie can be lazy-built
+        # on first ``get_tree()`` access, and skip the per-entry walk
+        # during the hot paloc-scan path.
+        self._tree_dirty_groups.add(group_dir)
 
         logger.info(
             "Loaded PAMT for %s: %d files",
@@ -120,6 +137,14 @@ class VfsManager:
         if group_dir in self._pamt_cache:
             del self._pamt_cache[group_dir]
             logger.info("Invalidated PAMT cache for group: %s", group_dir)
+        self._tree_dirty_groups.discard(group_dir)
+        # Drop the texture-service combined index too — its entries
+        # came from the PAMT we just invalidated.
+        try:
+            from core.mesh_texture_service import invalidate_pamt_index_cache
+            invalidate_pamt_index_cache(self)
+        except Exception:
+            pass
 
     def reload(self) -> None:
         """Drop every cache and rebuild the VFS from the packages
@@ -160,7 +185,14 @@ class VfsManager:
         self._papgt_data = None
         self._pamt_cache.clear()
         self._root = VfsNode(name="root", is_dir=True)
+        self._tree_dirty_groups.clear()
         self._logged_processing_warnings.clear()
+        # Drop downstream caches that were keyed on this VFS.
+        try:
+            from core.mesh_texture_service import invalidate_pamt_index_cache
+            invalidate_pamt_index_cache(self)
+        except Exception:
+            pass
         logger.info(
             "VFS reload: cleared %d cached PAMT group(s); "
             "caches will re-populate on next access.",
@@ -285,7 +317,22 @@ class VfsManager:
             )
 
     def get_tree(self) -> VfsNode:
-        """Get the VFS tree root."""
+        """Get the VFS tree root.
+
+        The trie is built lazily — entries from each PAMT are inserted
+        only on first access, not eagerly during ``load_pamt``. This
+        keeps cold-load fast (the trie costs ~5 s to populate across
+        all 34 groups) while preserving the contract that callers can
+        still walk a complete ``_root`` whenever they need it.
+        """
+        if self._tree_dirty_groups:
+            for group_dir in self._tree_dirty_groups:
+                pamt = self._pamt_cache.get(group_dir)
+                if not pamt:
+                    continue
+                for entry in pamt.file_entries:
+                    self._add_to_tree(entry, group_dir)
+            self._tree_dirty_groups.clear()
         return self._root
 
     def _add_to_tree(self, entry: PamtFileEntry, group_dir: str) -> None:

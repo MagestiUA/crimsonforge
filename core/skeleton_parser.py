@@ -52,6 +52,10 @@ class Skeleton:
     path: str = ""
     bones: list[Bone] = field(default_factory=list)
     bone_count: int = 0
+    # 24-bit bone hashes in PAB index order. Required for decoding the
+    # PAC's per-mesh skinning palette (slot index → palette[slot] = hash
+    # → PAB bone). Populated by parse_pab.
+    bone_hashes: list[int] = field(default_factory=list)
 
     def get_bone_by_name(self, name: str) -> Optional[Bone]:
         for b in self.bones:
@@ -198,6 +202,7 @@ def parse_pab(data: bytes, filename: str = "") -> Skeleton:
             break
 
         skeleton.bones.append(bone)
+        skeleton.bone_hashes.append(hash_lo24)
 
     # Pad any bones we couldn't read to keep mesh weight indices valid
     # (mesh refers to bone indices that must exist even if data is bad).
@@ -216,6 +221,7 @@ def parse_pab(data: bytes, filename: str = "") -> Skeleton:
                 rotation=(0.0, 0.0, 0.0, 1.0),
                 position=(0.0, 0.0, 0.0),
             ))
+            skeleton.bone_hashes.append(0)   # stub: unused hash slot
         logger.warning(
             "PAB %s: parsed %d of %d bones; padded %d stubs",
             filename, parsed_count, bone_count,

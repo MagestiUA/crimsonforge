@@ -955,11 +955,82 @@ class MainWindow(QMainWindow):
                 )
                 logger.info("Game updates detected: %s", update_msg)
 
-            self._show_main_tabs()
-            logger.info(
-                "Game activated: %s (%d groups, %d palocs) version=%s",
-                self._packages_path, len(groups), paloc_count, self._game_version,
+            # ── 10 s post-load grace window ──
+            # Background workers kicked off by ``initialize_from_game``
+            # (item-search index, "All Packages" row build,
+            # catalog rebuild) need a few seconds to finish before
+            # the user starts clicking around. Holding the loading
+            # screen for 10 s after the foreground steps finish lets
+            # those workers reach a usable state, so the first click
+            # in the Explorer doesn't queue behind 8+ s of pending
+            # async work.
+            #
+            # The countdown updates every second so the user sees
+            # progress instead of a static screen. ``_show_main_tabs``
+            # fires from the final tick.
+            self._post_load_remaining = 10
+            self._show_loading_screen(
+                "Loading Crimson Desert...",
+                f"Finalising background indexes... "
+                f"{self._post_load_remaining}s",
+                100,
             )
+
+            # ── Pre-warm the texture-service PAMT index cache ──
+            # First-click latency on any mesh in the Explorer drops
+            # from ~230 ms to ~0 ms once this cache is built. We do
+            # it on a worker so the grace-window countdown stays
+            # smooth — the build is ~200 ms of pure-Python dict work
+            # for group 0009's 402 k entries. By the time the user's
+            # first click lands, the cache is hot.
+            def _prewarm_texture_cache(_worker, vfs=self._vfs):
+                try:
+                    from core.mesh_texture_service import (
+                        compute_mesh_texture_report,
+                    )
+                    from core.mesh_parser import ParsedMesh
+                    # Empty mesh triggers the index build but skips the
+                    # per-submesh resolve loop — fastest possible warm.
+                    compute_mesh_texture_report(
+                        vfs, "warmup", ParsedMesh(),
+                    )
+                except Exception as exc:
+                    logger.debug("Texture-cache prewarm skipped: %s", exc)
+                return True
+
+            self._texcache_worker = FunctionWorker(_prewarm_texture_cache)
+            self._texcache_worker.start()
+
+            def _tick():
+                self._post_load_remaining -= 1
+                if self._post_load_remaining <= 0:
+                    self._show_main_tabs()
+                    # Restore the post-load status text — the grace
+                    # tick has been overwriting `self._status_label`
+                    # with "Loading Crimson Desert..." every second
+                    # via `_show_loading_screen`. Without this, the
+                    # bottom-left status bar stays stuck on the last
+                    # tick's text forever after main tabs appear.
+                    self._status_label.setText(
+                        f"Game loaded: {len(groups)} package groups, "
+                        f"{paloc_count} localization files"
+                    )
+                    logger.info(
+                        "Game activated: %s (%d groups, %d palocs) "
+                        "version=%s",
+                        self._packages_path, len(groups), paloc_count,
+                        self._game_version,
+                    )
+                    return
+                self._show_loading_screen(
+                    "Loading Crimson Desert...",
+                    f"Finalising background indexes... "
+                    f"{self._post_load_remaining}s",
+                    100,
+                )
+                QTimer.singleShot(1000, _tick)
+
+            QTimer.singleShot(1000, _tick)
         except Exception as e:
             self._on_load_error(str(e))
 

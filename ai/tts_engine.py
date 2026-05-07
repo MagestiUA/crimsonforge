@@ -1027,19 +1027,38 @@ class TTSEngine:
             config: Either a ConfigManager instance or a dict. API keys are read
                     from ai_providers.{provider_id}.api_key in the config.
         """
-        # Support both ConfigManager and dict
+        # Support both ConfigManager and dict.
+        #
+        # ── BUG (fixed 2026-05-07) ──
+        # The previous implementation tested ``hasattr(config, 'get')``
+        # before ``isinstance(config, dict)``. A plain dict ALSO has a
+        # ``.get()`` method, so the hasattr branch always matched first
+        # — and ``dict.get("ai_providers.elevenlabs_tts.api_key", "")``
+        # looked for that LITERAL flat key (which doesn't exist) rather
+        # than walking the dotted path.
+        #
+        # End-user symptom: "Generate + Patch" worked (single mode kept
+        # the live ConfigManager, whose ``.get`` supports dotted paths)
+        # but "Generate All + Patch" failed with 401 Unauthorized
+        # because the worker received ``self._config.data`` — a plain
+        # dict — and every API key resolved to the empty string.
+        # Provider made requests with ``xi-api-key: ""`` → 401.
+        #
+        # Fix: check the dict path FIRST. Only fall through to the
+        # ``.get`` branch for non-dict objects (ConfigManager and any
+        # other duck-typed wrapper that handles dotted keys natively).
         def _get(key, default=""):
-            if hasattr(config, 'get'):
-                return config.get(key, default)
             if isinstance(config, dict):
                 parts = key.split(".")
                 d = config
                 for p in parts:
-                    if isinstance(d, dict):
-                        d = d.get(p, default)
+                    if isinstance(d, dict) and p in d:
+                        d = d[p]
                     else:
                         return default
                 return d
+            if hasattr(config, 'get'):
+                return config.get(key, default)
             return default
 
         for pid, cls in TTS_PROVIDER_CLASSES.items():

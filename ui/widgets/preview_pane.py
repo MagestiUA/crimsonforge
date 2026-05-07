@@ -44,6 +44,88 @@ _QMediaPlayer = None
 _QVideoWidget = None
 
 
+def _prepare_mesh_data_async(
+    data: bytes, path: str, pane_state: dict,
+) -> dict:
+    """Worker-safe mesh preparation.
+
+    Pure-Python pipeline: parses the mesh, flattens it for the
+    viewer, resolves textures via the cached PAMT index, and builds
+    the GPU texture payload. Returns a dict the UI thread can feed
+    into :meth:`PreviewPane._render_prepared_mesh` to do the GL upload.
+
+    No Qt or OpenGL calls are made here — safe to run on a
+    ``FunctionWorker`` thread. ``pane_state`` is a snapshot of the
+    pane's vfs / vfs_path (so the worker doesn't race with the next
+    click changing those on the live PreviewPane instance).
+    """
+    try:
+        from core.mesh_parser import (
+            parse_mesh,
+            _flatten_parsed_mesh_for_preview,
+            _build_pac_preview_mesh,
+        )
+        ext = os.path.splitext(path.lower())[1]
+        full_mesh = None
+        if ext == ".pac":
+            preview_mesh = _build_pac_preview_mesh(
+                data, os.path.basename(path),
+            )
+        else:
+            full_mesh = parse_mesh(data, os.path.basename(path))
+            preview_mesh = _flatten_parsed_mesh_for_preview(full_mesh)
+
+        info_text = (
+            f"{preview_mesh.total_vertices:,} verts | "
+            f"{preview_mesh.total_faces:,} faces | "
+            f"{preview_mesh.submesh_count} submesh(es)"
+        )
+
+        # Texture pipeline (cached pamt_index, near-zero cost on
+        # the second click — see core.mesh_texture_service).
+        face_colors: list = []
+        texture_payload = None
+        vfs = pane_state.get("_active_vfs")
+        vfs_path = pane_state.get("_active_vfs_path")
+        if vfs is not None and vfs_path and full_mesh is not None:
+            try:
+                from core.mesh_texture_service import (
+                    build_gpu_texture_payload,
+                    compute_mesh_texture_report,
+                )
+                report = compute_mesh_texture_report(
+                    vfs, vfs_path, full_mesh,
+                )
+                if report.any_textured:
+                    for sm, entry in zip(
+                        full_mesh.submeshes, report.submeshes,
+                    ):
+                        if entry is None:
+                            face_colors.extend(
+                                [(180, 180, 180, 255)] * len(sm.faces),
+                            )
+                        else:
+                            face_colors.extend(entry.face_colors)
+                    texture_payload = build_gpu_texture_payload(
+                        full_mesh, report,
+                    )
+            except Exception:
+                # Non-fatal — preview still renders monochrome.
+                pass
+
+        return {
+            "preview_mesh": preview_mesh,
+            "full_mesh": full_mesh,
+            "info_text": info_text,
+            "face_colors": face_colors,
+            "texture_payload": texture_payload,
+            "raw_data": data,
+            "path": path,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _ensure_multimedia():
     global _QAudioOutput, _QMediaPlayer, _QVideoWidget
     if _QMediaPlayer is None:
@@ -469,7 +551,8 @@ class PreviewPane(QWidget):
         except Exception as exc:
             return f"DDS preview unavailable: {exc}"
 
-    def _compute_preview_texture_data(self, data: bytes, path: str):
+    def _compute_preview_texture_data(self, data: bytes, path: str,
+                                       parsed_mesh=None):
         """Resolve textures for the mesh and return GPU-ready payload + face colours.
 
         The OpenGL viewer consumes the ``GpuTexturePayload`` for true
@@ -480,18 +563,27 @@ class PreviewPane(QWidget):
 
         Returns ``(face_colors, texture_payload)`` — either may be
         empty / None when no diffuse textures resolved.
+
+        ``parsed_mesh``: pre-parsed mesh from the caller. When ``None``
+        we fall back to parsing here, but that path was responsible
+        for the duplicate-parse cost (a 27k-vert PAMLOD got parsed
+        once by ``build_preview_mesh`` and AGAIN here, ~0.5 s each).
+        Callers that already hold a parsed mesh should pass it in to
+        eliminate the second parse.
         """
         if self._active_vfs is None or not self._active_vfs_path:
             return [], None
 
         try:
-            from core.mesh_parser import parse_mesh
             from core.mesh_texture_service import (
                 build_gpu_texture_payload,
                 compute_mesh_texture_report,
             )
 
-            full_mesh = parse_mesh(data, os.path.basename(path))
+            if parsed_mesh is None:
+                from core.mesh_parser import parse_mesh
+                parsed_mesh = parse_mesh(data, os.path.basename(path))
+            full_mesh = parsed_mesh
             if not full_mesh.submeshes:
                 return [], None
 
@@ -519,68 +611,184 @@ class PreviewPane(QWidget):
             return [], None
 
     def _show_mesh_info(self, path: str) -> None:
-        """Show an interactive 3D preview of the mesh."""
-        try:
-            from core.mesh_parser import build_preview_mesh, parse_mesh
+        """Show an interactive 3D preview of the mesh.
 
+        ── PERF (2026-05-07) ──
+        The CPU portion of the mesh preview (parse + flatten + texture
+        resolve) runs on a background ``FunctionWorker`` so the UI
+        thread never blocks on a click. For a 33 k-vert sphere this is
+        ~350 ms of pure Python work — synchronous, that's a frozen
+        cursor; async, the click feels instant and the preview lands
+        when the worker completes.
+
+        Only the GL upload (``_mesh_viewer.set_mesh``) stays on the
+        main thread, since the OpenGL context is bound there.
+
+        Cancellation: when the user clicks a different file before the
+        previous worker finishes, ``self._active_mesh_token`` advances
+        and the in-flight worker's result is dropped on completion.
+        """
+        try:
+            # Read upfront on the UI thread (cheap, file's typically
+            # < 1 MB). The worker only does CPU work on already-loaded
+            # bytes — keeps Qt's QThread story simple.
             with open(path, "rb") as f:
                 data = f.read()
-            preview_mesh = build_preview_mesh(data, os.path.basename(path))
-
-            if self._mesh_viewer is not None and preview_mesh.vertices and preview_mesh.faces:
-                info_text = (
-                    f"{preview_mesh.total_vertices:,} verts | {preview_mesh.total_faces:,} faces | "
-                    f"{preview_mesh.submesh_count} submesh(es)"
-                )
-
-                # Try to colour the preview with the paired DDS texture.
-                # This only kicks in when the caller (Explorer) passed a
-                # VFS context — file-system previews stay monochrome.
-                face_colors, texture_payload = self._compute_preview_texture_data(data, path)
-                if (texture_payload is not None and not texture_payload.is_empty) or face_colors:
-                    info_text += "  |  textured"
-
-                viewer_kwargs: dict = {
-                    "info_text": info_text,
-                    "face_colors": face_colors,
-                }
-                # Older viewers (software, legacy builds) don't accept
-                # texture_payload — inspect the signature so we only pass
-                # it when supported.
-                import inspect
-                sig = inspect.signature(self._mesh_viewer.set_mesh)
-                if "texture_payload" in sig.parameters:
-                    viewer_kwargs["texture_payload"] = texture_payload
-
-                self._mesh_viewer.set_mesh(
-                    preview_mesh.vertices,
-                    preview_mesh.faces,
-                    preview_mesh.normals,
-                    **viewer_kwargs,
-                )
-                self._info_label.setText(self._info_label.text() + f"  |  {info_text}")
-                self._stack.setCurrentIndex(IDX_MESH)
-                return
-
-            mesh = parse_mesh(data, os.path.basename(path))
-            if not mesh.submeshes:
-                self._show_empty("No geometry found in this mesh file")
-                return
-
-            # Render to a static image (fast — no interactive 3D)
-            pixmap = self._render_mesh_image(mesh)
-            if pixmap and not pixmap.isNull():
-                self._image_label.setPixmap(pixmap)
-                self._info_label.setText(
-                    self._info_label.text() +
-                    f"  |  {mesh.total_vertices:,} verts  |  {mesh.total_faces:,} faces  |  "
-                    f"{len(mesh.submeshes)} submesh(es)"
-                )
-                self._stack.setCurrentIndex(IDX_IMAGE)
-            else:
-                self._show_empty("Could not render mesh preview")
         except Exception as e:
-            self._show_empty(f"Mesh parse error: {e}")
+            self._show_empty(f"Mesh read error: {e}")
+            return
+
+        # Tiny meshes prepare in <2 ms — running them on a worker just
+        # adds thread-handoff overhead. Synchronous fast path skips the
+        # worker entirely when the file is small enough that the worker
+        # would actually slow it down.
+        if len(data) < 50_000:
+            self._render_prepared_mesh(self._prepare_mesh_data(data, path))
+            return
+
+        # Larger meshes go async. Bump the token first so any in-flight
+        # worker's result gets dropped when it returns.
+        self._active_mesh_token = getattr(self, "_active_mesh_token", 0) + 1
+        token = self._active_mesh_token
+        self._info_label.setText(
+            f"{os.path.basename(path)}  |  Loading mesh…"
+        )
+
+        # Capture the active VFS + path so the worker doesn't read
+        # them off ``self`` (which would race with the next click).
+        vfs_snapshot = self._active_vfs
+        vfs_path_snapshot = self._active_vfs_path
+
+        def _worker_task(_worker, data=data, path=path,
+                         vfs=vfs_snapshot, vfs_path=vfs_path_snapshot):
+            # Snapshot pane state into local vars so the worker can
+            # call ``_compute_preview_texture_data`` safely.
+            pane_state = {
+                "_active_vfs": vfs,
+                "_active_vfs_path": vfs_path,
+            }
+
+            # We can't call ``self._compute_preview_texture_data``
+            # directly from the worker without poking ``self`` — the
+            # next click might already have flipped vfs_path. Inline
+            # the resolve here using the snapshotted state.
+            return _prepare_mesh_data_async(data, path, pane_state)
+
+        from utils.thread_worker import FunctionWorker
+
+        def _on_done(result, expected_token=token):
+            if expected_token != self._active_mesh_token:
+                # User clicked a newer file; drop this stale result.
+                return
+            self._render_prepared_mesh(result)
+
+        worker = FunctionWorker(_worker_task)
+        worker.finished_result.connect(_on_done)
+        worker.error_occurred.connect(
+            lambda err: self._show_empty(f"Mesh parse error: {err}"),
+        )
+        # Hold a reference so it isn't GC'd mid-flight.
+        self._mesh_worker = worker
+        worker.start()
+        return
+
+    def _prepare_mesh_data(self, data: bytes, path: str) -> dict:
+        """CPU-only mesh preparation (synchronous fast path).
+
+        Used directly for tiny meshes (where the worker overhead would
+        cost more than the work itself) and as the implementation
+        backend for the async worker path. Returns a dict the caller
+        feeds into :meth:`_render_prepared_mesh`.
+        """
+        return _prepare_mesh_data_async(
+            data, path,
+            {"_active_vfs": self._active_vfs,
+             "_active_vfs_path": self._active_vfs_path},
+        )
+
+    def _render_prepared_mesh(self, prepared: dict) -> None:
+        """Apply the worker-prepared data on the UI thread.
+
+        Only this step needs the OpenGL context and Qt main-thread
+        access. Everything before it (parse, flatten, texture
+        resolve, GPU buffer build) ran on the worker.
+        """
+        if prepared is None or "error" in prepared:
+            self._show_empty(
+                f"Mesh parse error: {prepared.get('error') if prepared else 'unknown'}",
+            )
+            return
+
+        preview_mesh = prepared.get("preview_mesh")
+        if (self._mesh_viewer is not None
+                and preview_mesh is not None
+                and preview_mesh.vertices and preview_mesh.faces):
+            info_text = prepared["info_text"]
+            face_colors = prepared["face_colors"]
+            texture_payload = prepared["texture_payload"]
+            if (texture_payload is not None
+                    and not texture_payload.is_empty) or face_colors:
+                info_text += "  |  textured"
+
+            viewer_kwargs = {
+                "info_text": info_text,
+                "face_colors": face_colors,
+            }
+            if self._set_mesh_supports_texture_payload():
+                viewer_kwargs["texture_payload"] = texture_payload
+
+            self._mesh_viewer.set_mesh(
+                preview_mesh.vertices,
+                preview_mesh.faces,
+                preview_mesh.normals,
+                **viewer_kwargs,
+            )
+            self._info_label.setText(
+                self._info_label.text() + f"  |  {info_text}",
+            )
+            self._stack.setCurrentIndex(IDX_MESH)
+            return
+
+        # Static-image fallback (no GL viewer or empty mesh).
+        from core.mesh_parser import parse_mesh
+        mesh = prepared.get("full_mesh")
+        if mesh is None:
+            try:
+                mesh = parse_mesh(
+                    prepared["raw_data"],
+                    os.path.basename(prepared["path"]),
+                )
+            except Exception as e:
+                self._show_empty(f"Mesh parse error: {e}")
+                return
+        if not mesh.submeshes:
+            self._show_empty("No geometry found in this mesh file")
+            return
+        pixmap = self._render_mesh_image(mesh)
+        if pixmap and not pixmap.isNull():
+            self._image_label.setPixmap(pixmap)
+            self._info_label.setText(
+                self._info_label.text() +
+                f"  |  {mesh.total_vertices:,} verts  |  "
+                f"{mesh.total_faces:,} faces  |  "
+                f"{len(mesh.submeshes)} submesh(es)",
+            )
+            self._stack.setCurrentIndex(IDX_IMAGE)
+        else:
+            self._show_empty("Could not render mesh preview")
+
+    def _set_mesh_supports_texture_payload(self) -> bool:
+        """Cache the inspect.signature lookup. Was running every click."""
+        cached = getattr(self, "_set_mesh_takes_payload", None)
+        if cached is None:
+            import inspect
+            try:
+                sig = inspect.signature(self._mesh_viewer.set_mesh)
+                cached = "texture_payload" in sig.parameters
+            except Exception:
+                cached = False
+            self._set_mesh_takes_payload = cached
+        return cached
 
     def _render_mesh_image(self, mesh) -> "QPixmap":
         """Render mesh to a static QPixmap with shaded faces."""

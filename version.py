@@ -17,11 +17,38 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.24.1"
+APP_VERSION = "1.25.0"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.25.0", "2026-05-07", [
+            "[Mesh import] OBJ → PAC import is now intent-aware. When the OBJ carries explicit submesh names that match the original PAC, the OBJ is treated as authoritative — submeshes the user removed get emitted as empty placeholders (zero verts / zero faces) so the descriptor count stays valid for the rebuilder while the game and preview render only the submeshes the user kept. Fully unnamed OBJs still take the legacy positional path. Verified end-to-end on helmet 0363 with a 2-of-7 OBJ.",
+            "[Mesh import] PAC vertex layout fully reverse-engineered against the shipping shader DXIL. Tangents now MikkTSpace-recomputed per-vertex; normals written into the engine's actual bit layout (bits 10-29 + sign bit 30); bone-skinning decode reads 8-bit weights from bytes 28-35 with 6×10-bit indices in bytes 20-27 + the 4-bone-vs-6-bone gate from byte 39's low 6 bits — fixes white-with-sparks lighting and dropped-influence skinning on multi-bone meshes.",
+            "[FBX export] Skin weights resolve via the per-mesh palette table embedded in section 0 of every PAC (longest run of valid PAB hashes at 4-byte stride). Replaces the v1.25.2-1.25.4 heuristic K-NN / centroid passes that cross-contaminated weights on layered armor.",
+            "[FBX export] UVs no longer drop on character export. Per-bone visual length (`LimbNode.Size`) is now the world-space distance to the longest-reach child bone, so finger leaves draw small and legs draw big in Blender / Maya / Unreal — matches anatomy without breaking the round-trip back to PAC.",
+            "[FBX export] 'Export Full Character FBX (Mesh + Bones + Animation)' menu unhidden in the Explorer — v1.25 makes the skin mapping reliable enough to ship.",
+            "[Repack] Path-resolution fix: `find_file_entry` now picks the LONGEST matching path, not the first. Shipping PAMTs carry both shortcut aliases AND the real nested entry for the same basename; the previous resolver patched the shortcut and the game ignored it, making patches invisible. New `Preview Resolution` button on the Repack tab shows which canonical path each selected file will hit before any disk write.",
+            "[Audio] Generate All + Patch no longer fails with 401 Unauthorized while the single Generate + Patch works with the same key. `TTSEngine.initialize_from_config` was checking `hasattr(config, 'get')` before `isinstance(config, dict)`, and dict's `.get` doesn't walk dotted paths — so batch mode (which receives `self._config.data`) initialised every provider with an empty key. Fixed for ElevenLabs and every other nested-key provider.",
+            "[Audio] BNK preview failures (Crimson Desert ships some Wwise SoundBanks in an encrypted variant the bundled vgmstream can't decode) are now logged as WARNING with the BNK name + size instead of generic ERROR — the audio pipeline isn't broken, only those specific BNK files. Single-WEM previews keep working.",
+            "[Performance] Cold-load against a 1.5M-entry game install drops from ~30s to ~11.5s. Skipped the never-consumed VFS trie inside `load_pamt`, deferred the item-search index to a background worker (no more 7.7s UI freeze), inlined the `_ArchiveRow` path-split via `rfind` + slice instead of `os.path.basename` (4.7× speedup on row construction), and cached the texture-service combined PAMT index so click latency drops from ~230ms to ~0.3ms after the first click.",
+            "[Performance] Async mesh preview — heavy parse + GPU prep runs on a `FunctionWorker` so the UI never freezes on a click; tiny meshes still take a sync fast path. 'Loading mesh…' status appears immediately, full preview lands when the worker finishes.",
+            "[Performance] Font Builder no longer re-parses all 34 PAMTs from disk on init — reuses the cached VfsManager (~10s saved on shipping installs).",
+            "[UX] Splash screen visible from the first frame so the user never sees the OS shell shadow + blank white client area on cold launch / fast reopen. Loading screen now adds a 10-second post-load grace window with a per-second countdown so background indexes finish warming before the first click. Bottom-left status bar correctly flips to 'Game loaded: N package groups, M localization files' when loading completes.",
+            "[Explorer] Ctrl+C copies the selected file's name (basename + extension) to the clipboard. Multi-select copies one filename per line. Scoped to the archive view so it doesn't shadow Ctrl+C in the preview pane / editor / search box.",
+            "[Build] `PyOpenGL_accelerate>=3.1.10` added to `requirements.txt` (a wheel exists for Python 3.14 / Windows). The startup log line 'No OpenGL_accelerate module loaded' is gone after a fresh `pip install -r requirements.txt`.",
+            "[Item Catalog] CSV export no longer crashes with `dict contains fields not in fieldnames: 'display_name', 'icon_paths'` — fieldnames are now derived from `asdict(items[0])` so future schema changes don't need a manual sync.",
+            "[Tests] +12 regression tests covering the OBJ-deletion intent path, the path-resolution longest-match rule, and the TTS dict-config dotted-path lookup. Full suite: 1206 passed.",
+        ],
+    ),
+    (
+        "1.24.2", "2026-05-06", [
+            "[Hotfix] Explorer search `ext:.dds canta` (and any other field-filter combined with extra terms) now works. The bare-extension shortcut was consuming the whole search string, so `ext:.dds canta` ended up filtering on the literal extension `.dds canta` which no row could match. Shortcut now fires only when the query is the bare extension with no further terms; richer queries route through the parsed evaluator that correctly applies the ext filter AND every other clause.",
+            "[Hotfix] Explorer search keystroke latency on the 1.4 M-row file list is back under one frame for complex queries. The first cut of the enterprise parser tokenised every row's path on every keystroke, which made boolean / field / wildcard queries feel sluggish on a fully-loaded archive. The complex-query path now uses C-fast substring + fnmatch checks per clause and never tokenises the path corpus inside the per-row loop. Simple single-token queries still take the v1.24.0 Tier A / Tier B fast path.",
+            "[Hotfix] Catalog Browser no longer points at non-existent .pac files for items whose iteminfo prefab hash resolves to an `_index01_n.prefab` / `_index02_n.prefab` / `_n.prefab` descriptor. Previously `core.item_index.build_item_index` and `core.item_catalog.parse_iteminfo_records` synthesised a `.pac` filename by stripping a fixed list of suffixes (`_l _r _u _s _t _index01 _index02 _index03`) from the resolved prefab name and appending `.pac`, with no check that the resulting file actually shipped — so the Demenissian Soldier's Cloth Barding catalog row showed `cd_r0002_00_horse_ub_0019_index01_n.pac` (a fabricated name) instead of the real `cd_r0002_00_horse_ub_0019.pac` + `cd_r0002_00_horse_ub_0019_sub01.pac` files the engine loads. Both modules now strip compound `_index??_n` and bare `_n` suffixes (longest-first), then verify each candidate stem against the live PAMT and only keep stems that exist as a real `.pac` entry. Bumps the catalog parser version so cached pickles rebuild silently on next launch.",
+        ],
+    ),
     (
         "1.24.1", "2026-05-06", [
             "[Fix] PAC reimport now writes replacement mesh normals during same-topology in-place rebuilds, preventing stale donor custom normals from causing dark, flipped, or sticker-like lighting patches on imported OBJ/FBX meshes.",

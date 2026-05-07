@@ -1408,19 +1408,31 @@ def parse_pac(data: bytes, filename: str = "") -> ParsedMesh:
                 # produces the upper-body-shatter artifact (slot 17
                 # would map to PAB[17] = R Thigh when the correct
                 # answer is PABC[17] = R ThighTwist).
-                raw_weights = struct.unpack_from("<BBBB", data, rec_off + 28)
-                raw_slots   = struct.unpack_from("<BBBB", data, rec_off + 32)
+                # 8-bone skinning layout (verified May 2026 from shader DXIL —
+                # see test_only/research/PAC_VERTEX_RECORD_DECODED.md):
+                #   bytes 28-35: 8 × u8 weights (each / 255)
+                #   bytes 20-27: bone palette slots 0-5 packed 6 × 10-bit
+                #   bytes 12-15: bone palette slots 6-7 as 2 × f16 (int + 0.5)
+                raw_weights = struct.unpack_from("<BBBBBBBB", data, rec_off + 28)
+                b20_lo, b20_hi = struct.unpack_from("<II", data, rec_off + 20)
+                slot6_h, slot7_h = struct.unpack_from("<ee", data, rec_off + 12)
+                raw_slots = (
+                     b20_lo        & 0x3FF,
+                    (b20_lo >> 10) & 0x3FF,
+                    (b20_lo >> 20) & 0x3FF,
+                     b20_hi        & 0x3FF,
+                    (b20_hi >> 10) & 0x3FF,
+                    (b20_hi >> 20) & 0x3FF,
+                    int(slot6_h + 0.5) if not math.isnan(slot6_h) else 0,
+                    int(slot7_h + 0.5) if not math.isnan(slot7_h) else 0,
+                )
                 mapped_slots = []
                 mapped_weights = []
                 weight_sum = sum(raw_weights)
                 inv_sum = (1.0 / weight_sum) if weight_sum > 0 else 0.0
                 for slot, weight in zip(raw_slots, raw_weights):
-                    if slot == 0xFF or weight == 0:
+                    if weight == 0:
                         continue
-                    # Store the raw slot. If the inline palette covers
-                    # this slot (the 4-entry fast-path) apply it now
-                    # so callers without a PABC still get something
-                    # sensible for slots 0-3.
                     if slot < len(bone_palette):
                         mapped_slots.append(int(bone_palette[slot]))
                     else:
@@ -1633,17 +1645,44 @@ def _decode_pac_position_u16(value: int, bbox_min: float, bbox_extent: float) ->
 
 
 def _decode_pac_normal(data: bytes, rec_off: int) -> tuple[float, float, float]:
+    """Decode the packed-normal u32 at vertex offset +16.
+
+    Verified against the shader DXIL of
+    ``CSMainSkinnedMeshStreamOutVertexData`` in
+    ``shader/skinnedmeshstreamout.hlsl``: the shader reads bits
+    10-19 → nx, 20-29 → ny, and uses bit 30 as the sign of nz.
+    nz magnitude is reconstructed as
+    ``sqrt(max(0, 1 - nx² - ny²))``, then negated when bit 30 is set.
+
+    Bits 0-9 and bit 31 of this u32 are NOT consumed by the streamout
+    shader. They carry engine-internal data that the parser does not
+    yet use; they are preserved verbatim across the round-trip.
+
+    Pre-May-2026 implementations of this function read three 10-bit
+    values from bits 0-29 and cyclically rotated them onto (nx, ny, nz)
+    — that legacy interpretation produced normals whose nz came from
+    bits 0-9 (which the engine doesn't read) and ignored the sign bit
+    at bit 30. It still gave plausible numbers because OBJ→PAC→OBJ
+    round-trips passed through unchanged donor data; it failed once
+    the user actually rebuilt geometry, because the in-game lighting
+    is driven by bit 30 and that bit was being preserved from the
+    donor instead of computed from the new mesh's nz sign.
+    """
     try:
         packed = struct.unpack_from("<I", data, rec_off + 16)[0]
     except struct.error:
         return (0.0, 1.0, 0.0)
 
-    nx_raw = (packed >> 0) & 0x3FF
-    ny_raw = (packed >> 10) & 0x3FF
-    nz_raw = (packed >> 20) & 0x3FF
-    nx = ny_raw / 511.5 - 1.0
-    ny = nz_raw / 511.5 - 1.0
-    nz = nx_raw / 511.5 - 1.0
+    nx_raw = (packed >> 10) & 0x3FF
+    ny_raw = (packed >> 20) & 0x3FF
+    nx = nx_raw / 511.5 - 1.0
+    ny = ny_raw / 511.5 - 1.0
+    nz_sq = 1.0 - nx * nx - ny * ny
+    if nz_sq < 0.0:
+        nz_sq = 0.0
+    nz = math.sqrt(nz_sq)
+    if packed & 0x40000000:
+        nz = -nz
     return (nx, ny, nz)
 
 
@@ -1670,20 +1709,69 @@ def _decode_pac_vertex_record(
 
     packed_bones: tuple[int, ...] = ()
     packed_weights: tuple[float, ...] = ()
-    if rec_off + 36 <= len(data):
-        # CRITICAL FIX: bytes 28-31 = WEIGHTS, bytes 32-35 = INDICES.
-        # Verified by sum-check: bytes 28-31 sum to ~240-255 (u8
-        # weight pattern), bytes 32-35 contain small palette indices.
-        # The previous code had these reversed, causing upper body
-        # vertices to bind to leg-region bones (= explosion).
-        raw_weights = struct.unpack_from("<BBBB", data, rec_off + 28)
-        raw_slots   = struct.unpack_from("<BBBB", data, rec_off + 32)
+    if rec_off + 40 <= len(data):
+        # Verified May 2026 by reverse-engineering the actual shipping shader
+        # ``CSMainSkinnedMeshStreamOutVertexData`` from
+        # ``shader/skinnedmeshstreamout.hlsl`` (DXIL via ``dxc -dumpbin``).
+        # See ``test_only/research/PAC_VERTEX_RECORD_DECODED.md`` for the
+        # full evidence (each shader instruction quoted).
+        #
+        # ── BONE-COUNT GATE (DXIL lines 558-577, 705-707, 737-740) ──
+        # %216 = (byte39_high6 * 0.0159 < 1.0)        # 8-bone-mode flag
+        # %298 = (LOD_param < 512) AND NOT %216
+        # %299 = if %298: i16 6 else: i16 4           # active bone count
+        # %320 = IMin(%299, 4)         # first batch processes %299..4 bones
+        # %346 = %299 - 4              # second batch processes max(0, %299-4)
+        # The engine reads ONLY the first %299 (slot, weight) pairs.
+        # Slots 6 and 7 (f16 at bytes 12-15) are STORED but NEVER READ —
+        # they're real texcoord components (UV2 / UV3 for the streamout
+        # shader's texcoord half4 at offset 8). Pre-2026-05-08 implementations
+        # decoded slots 6,7 as ``int(half + 0.5)`` and added their weights
+        # to the resolution; that was a misread of the shader. The engine's
+        # %299 is bounded at 6, so slots 6,7 are dead weight in the file.
+        #
+        # The byte39 high-6-bit predicate is: byte39 LO 6 bits == 63 ⇒ %216
+        # FALSE ⇒ %299 = 6. Otherwise %299 = 4 (assuming LOD < 512, which
+        # is always true for LOD-0/1 rendering — the path we extract).
+        #
+        # ── STORAGE LAYOUT ──
+        #   bytes 8-15  — half4 _texcoord (UV.xy at 8-11, UV2.xy at 12-15)
+        #   bytes 16-19 — packed normal (bits 10-19→nx, 20-29→ny, 30=nz sign)
+        #   bytes 20-27 — uint2 _packedBoneIndex (6 × 10-bit slots)
+        #                 slot[0] = bits 0-9   of u32 at offset 20
+        #                 slot[1] = bits 10-19
+        #                 slot[2] = bits 20-29
+        #                 slot[3] = bits 0-9   of u32 at offset 24
+        #                 slot[4] = bits 10-19
+        #                 slot[5] = bits 20-29
+        #   bytes 28-35 — uint2 _packedBoneWeight (8 × u8, but only the
+        #                 first %299 are read; remaining are dead bytes)
+        #   bytes 36-39 — _packedVertexColorRG_systemProperty
+        #                 byte 39 low-6 bits = bone-count gate (63 = 6-bone)
+        b39_low6 = data[rec_off + 39] & 0x3F
+        bone_count = 6 if b39_low6 == 63 else 4
+
+        raw_weights = struct.unpack_from("<BBBBBBBB", data, rec_off + 28)
+        b20_lo, b20_hi = struct.unpack_from("<II", data, rec_off + 20)
+
+        raw_slots = (
+             b20_lo        & 0x3FF,
+            (b20_lo >> 10) & 0x3FF,
+            (b20_lo >> 20) & 0x3FF,
+             b20_hi        & 0x3FF,
+            (b20_hi >> 10) & 0x3FF,
+            (b20_hi >> 20) & 0x3FF,
+        )
+        # Truncate to the active bone count — engine ignores the rest.
+        active_slots = raw_slots[:bone_count]
+        active_weights = raw_weights[:bone_count]
+
         mapped_bones = []
         mapped_weights = []
-        weight_sum = sum(raw_weights)
+        weight_sum = sum(active_weights)
         inv_sum = (1.0 / weight_sum) if weight_sum > 0 else 0.0
-        for slot, weight in zip(raw_slots, raw_weights):
-            if slot == 0xFF or weight == 0:
+        for slot, weight in zip(active_slots, active_weights):
+            if weight == 0:
                 continue
             mapped_bones.append(desc.palette[slot] if slot < len(desc.palette) else slot)
             mapped_weights.append(weight * inv_sum)
@@ -1975,6 +2063,12 @@ def parse_pac(data: bytes, filename: str = "") -> ParsedMesh:
     result.total_faces = sum(len(sm.faces) for sm in result.submeshes)
     result.has_uvs = any(sm.uvs for sm in result.submeshes)
 
+    # Stash the raw PAC bytes on the mesh so the skin-palette decoder
+    # can locate the per-mesh palette table without going back to disk.
+    # Used by ``derive_skin_slot_to_pab_geometric`` in the FBX export
+    # pipeline.
+    result._pac_bytes = data
+
     logger.info("Parsed PAC %s: %d submeshes, %d verts, %d faces",
                 filename, len(result.submeshes), result.total_vertices, result.total_faces)
     return result
@@ -2213,3 +2307,192 @@ def apply_skin_palette(mesh: ParsedMesh, slot_to_pab: list[int]) -> int:
         n_remapped, n_dropped,
     )
     return n_remapped
+
+
+def derive_skin_slot_to_pab_geometric(
+    mesh: ParsedMesh,
+    skeleton,
+) -> int:
+    """Resolve PAC vertex skin slots to PAB bones using the per-mesh
+    skinning palette table that the engine reads at runtime.
+
+    THE ENCODING (verified May 2026 by RE-ing real game data)
+    --------------------------------------------------------
+    Every shipping PAC contains a per-mesh skinning palette stored
+    as a contiguous run of 4-byte u32 entries inside section 0,
+    after the submesh descriptors. Each entry layout::
+
+        bits 0-23:  bone hash (24-bit, matches a PAB bone hash)
+        bits 24-31: random byte — uninspected by the engine
+
+    The vertex record's slot index is a DIRECT INDEX into this
+    table. ``palette[slot] = bone_hash`` -> resolve via the PAB's
+    bone-hash table to a global bone index. There is no further
+    indirection or fallback — the table IS the engine's authoritative
+    palette.
+
+    Verified on shipping data:
+
+      * Damian (`cd_phw_00_nude_00_0001_damian.pac`):
+        206-entry table at file offset 0x1DA. The right-shoulder
+        vertex's slot 65 -> palette[65] = ``Bip01 R ClavicleTwist``
+        (PAB index 140) at world position (-0.14, +1.56, +0.01) —
+        exactly where that vertex lives.
+
+      * UB_0151 (`cd_phw_00_ub_00_0151.pac`):
+        95-entry table at file offset 0x53A0.
+
+      * Iron Man helmet (`cd_phm_00_hel_00_0363.pac`):
+        58-entry table at file offset 0x3A1.
+
+    THE SCAN
+    --------
+    We don't yet have a deterministic byte-offset rule pointing at
+    the table from the section header (the section 0 header carries
+    the LOD section offsets but not the palette offset). So we
+    locate the table empirically by scanning every 4-byte boundary
+    in the PAC and finding the longest run whose low-24-bit matches
+    a known PAB bone hash. PAB hashes are 24-bit values in a sparse
+    16M-value space (448 bones / 16,777,216 keys ≈ 2.7 × 10⁻⁵ chance
+    of any random 3-byte sequence matching), so even 5 consecutive
+    matches is statistically impossible by chance — the longest run
+    we find IS the palette by construction.
+
+    Returns total (vertex, bone) pairs assigned. Mutates
+    ``mesh.submeshes[*].bone_indices/bone_weights`` in place,
+    converting palette slots to PAB bone indices.
+
+    Strict mode — NO FALLBACK. If a slot index is out of range of
+    the palette, OR a palette entry's hash doesn't resolve to a PAB
+    bone, that (vertex, slot) pairing is dropped. Vertices left with
+    no bones are emitted un-weighted (they stay in bind position
+    when bones rotate, never dragged to a guessed bone).
+    """
+    if not skeleton or not getattr(skeleton, "bones", None):
+        return 0
+
+    pab_hashes = getattr(skeleton, "bone_hashes", None)
+    if pab_hashes is None or len(pab_hashes) != len(skeleton.bones):
+        logger.warning(
+            "derive_skin_slot_to_pab_geometric: skeleton has no "
+            "bone_hashes attribute; cannot decode palette."
+        )
+        return 0
+    hash_to_pab = {h: i for i, h in enumerate(pab_hashes)}
+
+    pac_bytes = getattr(mesh, "_pac_bytes", None)
+    if pac_bytes is None:
+        logger.warning(
+            "derive_skin_slot_to_pab_geometric: mesh has no _pac_bytes "
+            "attribute; caller must stash raw PAC bytes."
+        )
+        return 0
+
+    palette = _scan_pac_skin_palette(pac_bytes, set(pab_hashes))
+    if not palette:
+        logger.warning(
+            "derive_skin_slot_to_pab_geometric: could not locate "
+            "skinning palette table in PAC bytes."
+        )
+        return 0
+    logger.info("Decoded PAC skinning palette: %d entries.", len(palette))
+
+    n_assigned = 0
+    n_dropped = 0
+    n_unresolved = 0
+    for sm in mesh.submeshes:
+        if not sm.bone_indices:
+            continue
+        new_indices: list[tuple[int, ...]] = []
+        new_weights: list[tuple[float, ...]] = []
+        for slots, weights in zip(sm.bone_indices, sm.bone_weights):
+            kept_b: list[int] = []
+            kept_w: list[float] = []
+            for s, w in zip(slots, weights):
+                w = float(w)
+                if w <= 0:
+                    continue
+                s = int(s)
+                if 0 <= s < len(palette):
+                    pab_h = palette[s]
+                    pab_i = hash_to_pab.get(pab_h, -1)
+                    if pab_i >= 0:
+                        kept_b.append(pab_i)
+                        kept_w.append(w)
+                        n_assigned += 1
+                        continue
+                    else:
+                        n_unresolved += 1
+                else:
+                    n_dropped += 1
+            if kept_b:
+                wsum = sum(kept_w)
+                if wsum > 1e-6:
+                    inv = 1.0 / wsum
+                    kept_w = [w * inv for w in kept_w]
+                merged: dict[int, float] = {}
+                for b, w in zip(kept_b, kept_w):
+                    merged[b] = merged.get(b, 0.0) + w
+                new_indices.append(tuple(merged.keys()))
+                new_weights.append(tuple(merged.values()))
+            else:
+                new_indices.append(())
+                new_weights.append(())
+        sm.bone_indices = new_indices
+        sm.bone_weights = new_weights
+
+    logger.info(
+        "PAC palette resolution: %d pairs assigned, %d slot-out-of-range, "
+        "%d hash-not-in-PAB.",
+        n_assigned, n_dropped, n_unresolved,
+    )
+    return n_assigned
+
+
+def _scan_pac_skin_palette(
+    pac_bytes: bytes, valid_hashes: set,
+) -> list[int]:
+    """Find the per-mesh skinning palette in a PAC.
+
+    Scans for the longest contiguous run of 4-byte u32 entries whose
+    low-24-bit matches a PAB bone hash. Returns the list of 24-bit
+    hashes in palette-index order, or an empty list if no qualifying
+    run exists.
+    """
+    n = len(pac_bytes)
+    best_off = -1
+    best_len = 0
+    i = 0
+    while i + 4 <= n:
+        word = (pac_bytes[i]
+                | (pac_bytes[i + 1] << 8)
+                | (pac_bytes[i + 2] << 16))
+        if word in valid_hashes:
+            run_len = 0
+            j = i
+            while j + 4 <= n:
+                w2 = (pac_bytes[j]
+                      | (pac_bytes[j + 1] << 8)
+                      | (pac_bytes[j + 2] << 16))
+                if w2 in valid_hashes:
+                    run_len += 1
+                    j += 4
+                else:
+                    break
+            if run_len > best_len:
+                best_len = run_len
+                best_off = i
+            i = j
+        else:
+            i += 1
+    if best_len < 5 or best_off < 0:
+        return []
+    palette: list[int] = []
+    for k in range(best_len):
+        off = best_off + k * 4
+        h = (pac_bytes[off]
+             | (pac_bytes[off + 1] << 8)
+             | (pac_bytes[off + 2] << 16))
+        palette.append(h)
+    return palette
+

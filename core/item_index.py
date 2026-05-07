@@ -208,22 +208,72 @@ def build_item_index(vfs: VfsManager, progress_fn=None) -> ItemIndex:
     model_display_aliases: dict[str, str] = {}
     items_with_models: list[ItemRecord] = []
 
+    # Set of real .pac stems (basename minus extension) so we can verify
+    # that a synthesized name actually exists. Without this check, an
+    # iteminfo prefab hash that resolves to a ``.prefab`` descriptor whose
+    # bare stem doesn't have a matching ``.pac`` (e.g.
+    # ``cd_r0002_00_horse_ub_0019_index01_n.prefab`` → no
+    # ``cd_r0002_00_horse_ub_0019_index01_n.pac`` exists, only
+    # ``cd_r0002_00_horse_ub_0019.pac`` and the ``_sub01`` variant) gets
+    # written into the catalog as a fabricated, unsearchable name.
+    real_pac_stems: set[str] = set()
+    real_pac_paths: dict[str, str] = {}  # stem -> full path (first-seen wins)
+    for entry in pamt_0009.file_entries:
+        ep = entry.path.replace("\\", "/").lower()
+        if ep.endswith(".pac"):
+            stem = os.path.splitext(os.path.basename(ep))[0]
+            real_pac_stems.add(stem)
+            real_pac_paths.setdefault(stem, ep)
+
+    # Suffix list ordered LONGEST-FIRST. Compound suffixes like
+    # ``_index01_n`` must strip before the bare ``_n`` / ``_index01``
+    # so we land on the correct base stem. The ``_n`` / ``_index??_n``
+    # forms are normal-map / "n-version" prefab variants — they
+    # describe the same logical mesh as the bare base.
+    SUFFIX_STRIP = (
+        "_index01_n", "_index02_n", "_index03_n",
+        "_index01", "_index02", "_index03",
+        "_l", "_r", "_u", "_s", "_t", "_n",
+    )
+
+    def _resolve_pac_stems(name: str) -> list[str]:
+        """Return real .pac stems matching ``name`` after suffix-strip.
+
+        Tries the bare base plus ``_sub01`` / ``_sub02`` variants.
+        Returns only stems that actually exist in the PAMT.
+        """
+        b = name
+        for sfx in SUFFIX_STRIP:
+            if b.endswith(sfx):
+                b = b[:-len(sfx)]
+                break
+        # Try bare, then _sub01 / _sub02 variants.
+        candidates = [b, b + "_sub01", b + "_sub02"]
+        return [c for c in candidates if c in real_pac_stems]
+
     for item in items:
         for prefab_hash in item.prefab_hashes:
             resolved = hash_table.get(prefab_hash)
             if not resolved:
                 continue
 
-            base = resolved
-            for suffix in ("_l", "_r", "_u", "_s", "_t", "_index01", "_index02", "_index03"):
-                if base.endswith(suffix):
-                    base = base[:-len(suffix)]
-                    break
+            stems = _resolve_pac_stems(resolved)
+            if not stems:
+                # No real PAC for this prefab — skip silently rather
+                # than fabricate a synthesised name. Items in this
+                # situation will still appear in the catalog with their
+                # display name and item id; we just don't lie about
+                # which mesh file they own.
+                continue
 
-            pac_name = base + ".pac"
-            if pac_name not in item.pac_files:
-                item.pac_files.append(pac_name)
-            pac_to_items.setdefault(pac_name, []).append(item)
+            base = stems[0]  # first real stem (typically bare base)
+            pac_name = base + ".pac"  # canonical name for alias terms below
+
+            for stem in stems:
+                stem_pac = stem + ".pac"
+                if stem_pac not in item.pac_files:
+                    item.pac_files.append(stem_pac)
+                pac_to_items.setdefault(stem_pac, []).append(item)
 
             # Include the ORIGINAL CamelCase ``internal_name`` alongside its
             # lowercased form. The Explorer search bar uses a CamelCase-aware

@@ -196,7 +196,11 @@ class FontTab(QWidget):
     def initialize_from_game(self, vfs: VfsManager) -> None:
         self._vfs = vfs
         self._packages_path = str(vfs._packages_path)
-        self._game_fonts = find_game_fonts(self._packages_path)
+        # Pass the cached VfsManager so ``find_game_fonts`` reuses the
+        # already-parsed PAMTs instead of re-parsing every 0.pamt from
+        # disk — that was ~10 s of redundant work on each Font Builder
+        # init (verified via log timing on a shipping 34-group install).
+        self._game_fonts = find_game_fonts(self._packages_path, vfs=vfs)
 
         self._font_combo.clear()
         for fi in self._game_fonts:

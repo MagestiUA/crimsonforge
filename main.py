@@ -25,6 +25,7 @@ except Exception:
     def log_and_show_fatal(title, message):   # type: ignore[no-redef]
         pass
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from version import APP_VERSION, APP_NAME
@@ -137,6 +138,95 @@ def main():
     logger.info("%s v%s starting...", APP_NAME, APP_VERSION)
     logger.info("Config loaded from: %s", config.config_path)
 
+    # ── Splash screen so the user doesn't see a blank/white window ──
+    # MainWindow's constructor builds 8 tabs, the OpenGL preview, the
+    # syntax-highlighted editor, etc. — that takes ~2-5 s on a fresh
+    # Python process (PySide6 imports + Qt resource init). Without a
+    # splash, Windows shows the OS shell shadow + a blank client area
+    # for that whole time. The splash is a fully-painted top-level
+    # window with a frameless dark style so Windows DOESN'T paint a
+    # blank client area first.
+    splash = None
+    try:
+        from PySide6.QtWidgets import QSplashScreen
+        from PySide6.QtGui import QPixmap, QColor, QPainter, QFont as _QFont, QLinearGradient
+        # Big enough to be visibly "the app starting", small enough to
+        # not dominate the screen on first run.
+        pix = QPixmap(560, 320)
+        # Solid base then gradient overlay so the pixmap NEVER paints
+        # transparent (even one transparent frame is what looks like
+        # the "white window" the user sees).
+        pix.fill(QColor("#11111b"))
+        p = QPainter(pix)
+        gradient = QLinearGradient(0, 0, 0, pix.height())
+        gradient.setColorAt(0.0, QColor("#1e1e2e"))
+        gradient.setColorAt(1.0, QColor("#11111b"))
+        p.fillRect(pix.rect(), gradient)
+        # Subtle border so the splash reads as a window, not just text.
+        p.setPen(QColor("#45475a"))
+        p.drawRect(0, 0, pix.width() - 1, pix.height() - 1)
+        # Title.
+        p.setPen(QColor("#cdd6f4"))
+        p.setFont(_QFont("Segoe UI", 32, _QFont.Bold))
+        p.drawText(0, 0, pix.width(), 200,
+                   Qt.AlignHCenter | Qt.AlignBottom, APP_NAME)
+        # Tagline.
+        p.setPen(QColor("#a6adc8"))
+        p.setFont(_QFont("Segoe UI", 11))
+        p.drawText(0, 200, pix.width(), 30,
+                   Qt.AlignHCenter | Qt.AlignVCenter,
+                   "Crimson Desert modding studio")
+        # Version + status bar at bottom.
+        p.setPen(QColor("#7f849c"))
+        p.setFont(_QFont("Segoe UI", 9))
+        p.drawText(0, pix.height() - 32, pix.width(), 20,
+                   Qt.AlignHCenter | Qt.AlignVCenter,
+                   f"v{APP_VERSION}")
+        p.end()
+
+        splash = QSplashScreen(pix)
+        # WindowStaysOnTopHint stops Windows hiding it behind the
+        # spawning console window during cold start.
+        splash.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        splash.show()
+        splash.showMessage(
+            "Loading Python modules...",
+            Qt.AlignHCenter | Qt.AlignBottom,
+            QColor("#cdd6f4"),
+        )
+        # Force the window manager to realise the splash and paint
+        # it BEFORE we start the expensive MainWindow constructor.
+        # processEvents is one round; we run a tiny event-loop spin
+        # here so X11/Wayland/Win32 all flush their compositor.
+        for _ in range(3):
+            app.processEvents()
+        splash.repaint()
+    except Exception as splash_exc:
+        logger.debug("Splash screen unavailable: %s", splash_exc)
+
+    def _splash_status(message: str) -> None:
+        """Update the splash's status line and force a repaint.
+
+        The user reported a "white window for ~5 s" symptom — that's
+        the gap between QApplication paint and MainWindow's first
+        widget render. Updating the splash with each major init
+        milestone keeps it visibly alive during that gap.
+        """
+        if splash is None:
+            return
+        try:
+            splash.showMessage(
+                message,
+                Qt.AlignHCenter | Qt.AlignBottom,
+                QColor("#cdd6f4"),
+            )
+            app.processEvents()
+            splash.repaint()
+        except Exception:
+            pass
+
+    _splash_status("Initialising AI provider stubs...")
+
     def _build_registry():
         """Construct the AI provider registry on first access.
 
@@ -154,10 +244,20 @@ def main():
         )
         return registry
 
+    _splash_status("Building main window...")
     window = MainWindow(config, registry_factory=_build_registry)
 
     _close_splash()
+    _splash_status("Almost ready...")
     window.show()
+    # Wait for the window to be fully painted before tearing down the
+    # splash — otherwise the user sees a momentary flash of nothing
+    # between splash dismissal and window first paint.
+    for _ in range(3):
+        app.processEvents()
+    if splash is not None:
+        splash.finish(window)
+        splash = None
 
     logger.info("Application ready")
     ret = app.exec()

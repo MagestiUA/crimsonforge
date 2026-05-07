@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from core.repack_engine import RepackEngine, ModifiedFile
-from core.pamt_parser import parse_pamt, find_file_entry
+from core.pamt_parser import parse_pamt, find_file_entry, find_all_file_entries
 from ui.widgets.progress_widget import ProgressWidget
 from ui.dialogs.file_picker import pick_directory
 from ui.dialogs.confirmation import show_error, show_info, confirm_action
@@ -103,6 +103,19 @@ class RepackTab(QWidget):
         layout.addLayout(opt_row)
 
         btn_row = QHBoxLayout()
+        # Preview button — runs path resolution against the live PAMTs
+        # and shows the user the canonical path each file will be patched
+        # at, plus any shortcut aliases being skipped. Catches the
+        # "patched the wrong entry" bug BEFORE it touches disk.
+        preview_btn = QPushButton("Preview Resolution")
+        preview_btn.setToolTip(
+            "Show which canonical path each selected file resolves to "
+            "(and which shortcut aliases are skipped) without modifying "
+            "any game files. Run this before Repack to catch wrong-entry "
+            "bugs."
+        )
+        preview_btn.clicked.connect(self._preview_resolution)
+        btn_row.addWidget(preview_btn)
         self._repack_btn = QPushButton("Repack Selected")
         self._repack_btn.setObjectName("primary")
         self._repack_btn.clicked.connect(self._repack)
@@ -331,6 +344,22 @@ class RepackTab(QWidget):
         self._worker.start()
 
     def _resolve_file_entry(self, basename):
+        """Find the canonical PAMT + entry to patch for a given basename.
+
+        Bug history (2026-05): basename-only lookups returned the FIRST
+        matching entry, but shipping PAMTs contain BOTH a shortcut alias
+        AND the real nested path for the same basename. The runtime
+        loader uses the nested path; patching the alias does nothing
+        in-game. Verified on `cd_phm_00_hel_00_0363.pac` — the alias
+        sits at ``character/cd_phm_00_hel_00_0363.pac`` while the real
+        entry is at ``character/model/1_pc/1_phm/armor/13_hel/...``.
+
+        Fix: scan EVERY group, collect EVERY matching entry across all
+        PAMTs, and pick the entry with the LONGEST canonical path. The
+        nested entry always has a deeper path than its shortcut, so this
+        rule selects the canonical entry by construction.
+        """
+        candidates: list[tuple[int, "PamtData", "PamtFileEntry"]] = []
         for item in sorted(os.listdir(self._game_path)):
             group_dir = os.path.join(self._game_path, item)
             pamt_path = os.path.join(group_dir, "0.pamt")
@@ -338,12 +367,141 @@ class RepackTab(QWidget):
                 continue
             try:
                 pamt_data = parse_pamt(pamt_path, paz_dir=group_dir)
-                entry = find_file_entry(pamt_data, basename)
-                if entry:
-                    return pamt_data, entry
             except Exception as e:
                 logger.warning("Error scanning %s: %s", item, e)
-        return None, None
+                continue
+            for entry in find_all_file_entries(pamt_data, basename):
+                depth = len(entry.path.replace("\\", "/"))
+                candidates.append((depth, pamt_data, entry))
+
+        if not candidates:
+            return None, None
+
+        # Deepest path wins — that's the canonical entry the game loads.
+        candidates.sort(key=lambda c: -c[0])
+        chosen = candidates[0]
+        if len(candidates) > 1:
+            shadow = ", ".join(
+                f"{c[2].path} (depth {c[0]})"
+                for c in candidates[1:5]
+            )
+            logger.info(
+                "Resolved %s -> %s (depth %d). Ignored shortcut/alias "
+                "entries: %s",
+                basename, chosen[2].path, chosen[0], shadow,
+            )
+        return chosen[1], chosen[2]
+
+    def _preview_resolution(self):
+        """Show every selected file's canonical resolution + skipped
+        aliases in a dialog. Read-only: never touches game files.
+        Helps the user catch wrong-target bugs before patching.
+        """
+        if not self._game_path or not os.path.isdir(self._game_path):
+            show_error(self, "Error",
+                       "Game path not set. Return to Game Setup tab "
+                       "and load the game first.")
+            return
+
+        checked: list[str] = []
+        for i in range(self._file_tree.topLevelItemCount()):
+            item = self._file_tree.topLevelItem(i)
+            if item.checkState(0) == Qt.Checked:
+                checked.append(item.data(0, Qt.UserRole))
+        if not checked:
+            show_error(self, "Error",
+                       "No files selected. Tick the files you want "
+                       "to preview first.")
+            return
+
+        lines: list[str] = []
+        n_canonical = n_alias = n_missing = n_dds = 0
+        for fpath in checked:
+            basename = os.path.basename(fpath)
+            cands = self._all_resolve_candidates(basename)
+            if not cands:
+                lines.append(f"[MISSING] {basename}")
+                lines.append("    no PAMT entry found in any group "
+                             "— this file cannot be patched.")
+                n_missing += 1
+                continue
+            cands.sort(key=lambda c: -len(c[1].path.replace("\\", "/")))
+            chosen_pamt, chosen = cands[0]
+            chosen_group = os.path.basename(os.path.dirname(chosen_pamt.path))
+            lines.append(f"[OK] {basename}")
+            lines.append(
+                f"    -> patches {chosen_group} :: {chosen.path}"
+            )
+            n_canonical += 1
+            for pamt_data, entry in cands[1:]:
+                grp = os.path.basename(os.path.dirname(pamt_data.path))
+                depth = len(entry.path.replace("\\", "/"))
+                chosen_depth = len(chosen.path.replace("\\", "/"))
+                if depth < chosen_depth:
+                    lines.append(
+                        f"    skipped (shortcut alias, depth "
+                        f"{depth} < {chosen_depth}): "
+                        f"{grp} :: {entry.path}"
+                    )
+                    n_alias += 1
+                else:
+                    # Same-depth duplicate — could be a real cross-group
+                    # alias. Surface it explicitly.
+                    lines.append(
+                        f"    NOTE another match at same depth in "
+                        f"{grp} :: {entry.path}"
+                    )
+            if basename.lower().endswith(".dds"):
+                n_dds += 1
+
+        header = (
+            f"Preview: {n_canonical} canonical target(s), "
+            f"{n_alias} shortcut alias(es) skipped, "
+            f"{n_missing} unresolved.\n"
+        )
+        if n_dds:
+            header += (
+                f"WARNING: {n_dds} .dds file(s) selected. CrimsonForge "
+                "does NOT yet update meta/0.pathc — newly-added DDS "
+                "paths may not load in-game until a future build adds "
+                "PATHC handling. Existing DDS replacements are fine.\n"
+            )
+        header += "\n"
+        text = header + "\n".join(lines)
+
+        # Use a scrollable dialog so long lists stay readable.
+        from PySide6.QtWidgets import QDialog, QPlainTextEdit
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Repack Resolution Preview")
+        dlg.resize(800, 500)
+        v = QVBoxLayout(dlg)
+        text_edit = QPlainTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(text)
+        v.addWidget(text_edit)
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.accept)
+        v.addWidget(close)
+        dlg.exec()
+
+    def _all_resolve_candidates(self, basename):
+        """Return every (pamt_data, entry) pair across all groups whose
+        path or basename matches ``basename``. Used by the dry-run
+        preview to show the user which alias entries are being skipped.
+        """
+        out: list[tuple["PamtData", "PamtFileEntry"]] = []
+        for item in sorted(os.listdir(self._game_path)):
+            group_dir = os.path.join(self._game_path, item)
+            pamt_path = os.path.join(group_dir, "0.pamt")
+            if not os.path.isfile(pamt_path):
+                continue
+            try:
+                pamt_data = parse_pamt(pamt_path, paz_dir=group_dir)
+            except Exception:
+                continue
+            for entry in find_all_file_entries(pamt_data, basename):
+                out.append((pamt_data, entry))
+        return out
 
     def _on_repack_done(self, result):
         self._repack_btn.setEnabled(True)

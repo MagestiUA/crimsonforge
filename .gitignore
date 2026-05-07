@@ -17,6 +17,11 @@ exports/
 export_test/
 CrimsonForgeOverlay/
 
+# Local test workshop — never committed.
+# Holds research notes, scratch tools, and UI prototypes that
+# experiment with the import / patch pipeline outside the main app.
+test_only/
+
 # Tool caches
 .pytest_cache/
 .mypy_cache/

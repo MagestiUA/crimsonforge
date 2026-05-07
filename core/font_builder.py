@@ -68,15 +68,36 @@ class FontInfo:
     entry: PamtFileEntry
 
 
-def find_game_fonts(packages_path: str) -> list[FontInfo]:
-    """Scan all package groups for font files (.ttf, .otf)."""
+def find_game_fonts(packages_path: str, vfs=None) -> list[FontInfo]:
+    """Scan all package groups for font files (.ttf, .otf).
+
+    ``vfs`` (optional): when provided, this function reuses the
+    PAMTs already cached on the VfsManager instead of re-parsing
+    them from disk. Without it we cold-parse every group's PAMT
+    again — on a shipping install that's ~10 seconds of redundant
+    work at every Font Builder tab init.
+    """
     fonts = []
-    for grp in sorted(os.listdir(packages_path)):
-        pamt_path = os.path.join(packages_path, grp, "0.pamt")
-        if not os.path.isfile(pamt_path):
-            continue
+    if vfs is not None:
         try:
-            pamt = parse_pamt(pamt_path, paz_dir=os.path.join(packages_path, grp))
+            groups = vfs.list_package_groups()
+        except Exception:
+            groups = sorted(os.listdir(packages_path))
+    else:
+        groups = sorted(os.listdir(packages_path))
+
+    for grp in groups:
+        try:
+            if vfs is not None:
+                pamt = vfs.load_pamt(grp)  # cached: instant on warm calls
+            else:
+                pamt_path = os.path.join(packages_path, grp, "0.pamt")
+                if not os.path.isfile(pamt_path):
+                    continue
+                pamt = parse_pamt(
+                    pamt_path,
+                    paz_dir=os.path.join(packages_path, grp),
+                )
             for entry in pamt.file_entries:
                 ext = os.path.splitext(entry.path.lower())[1]
                 if ext in (".ttf", ".otf", ".woff", ".woff2"):

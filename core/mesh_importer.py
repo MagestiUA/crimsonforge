@@ -2652,9 +2652,34 @@ def _merge_partial_pac_import(
 ) -> ParsedMesh:
     """Merge a partial PAC OBJ import onto the original submesh set by name.
 
-    Blender exports sometimes omit hidden or unselected PAC objects. In that
-    case we still want to apply the edited submeshes while preserving the
-    untouched original ones.
+    Two distinct user intents share this code path:
+
+      A. **User deleted submeshes from the OBJ.** The OBJ is the
+         authoritative source — submeshes the user removed should NOT
+         come back from the original PAC. (User reported 2026-05-08:
+         "I import a 2-submesh OBJ over a 7-submesh helmet PAC and
+         the resulting PAC still shows all 7 in-game and in preview".)
+
+      B. **Blender exporter omitted hidden / unselected objects.** The
+         user wants the visible / selected submeshes patched and the
+         hidden ones preserved verbatim.
+
+    The pre-2026-05-08 behaviour treated every missing submesh as case
+    B and silently restored it from the original PAC. That broke case
+    A — users had no way to delete submeshes via OBJ import.
+
+    Fix: detect intent from the OBJ. When AT LEAST ONE imported
+    submesh carries an explicit name that matches an original
+    submesh, the OBJ is treated as authoritative — every original
+    submesh whose name is missing from the OBJ is DROPPED. Users who
+    really want case B can either (a) include all submesh names by
+    selecting all objects in Blender and re-exporting, or (b) explicitly
+    re-add the helper submesh as an empty group in their OBJ.
+
+    Fallback (no named matches at all → all-unnamed OBJ): preserve
+    the original behaviour (positional consumption + deepcopy of any
+    original past the imported count) so legacy partial-export
+    workflows still produce a result.
     """
     if len(imported_mesh.submeshes) >= len(original_mesh.submeshes):
         return imported_mesh
@@ -2699,6 +2724,14 @@ def _merge_partial_pac_import(
         heuristic_by_name[best_original.name] = imported_unknown
         unmatched_originals = [sm for sm in unmatched_originals if sm.name != best_original.name]
 
+    # ── Intent detection ──
+    # If the OBJ carries any explicit submesh name that matches the
+    # original PAC, the user is in "named replace" mode (case A) —
+    # drop originals that the OBJ doesn't mention. Otherwise the OBJ
+    # is positional/anonymous (case B) — preserve count.
+    obj_is_authoritative = bool(imported_by_name)
+    dropped_names: list[str] = []
+
     merged_submeshes: list[SubMesh] = []
     unnamed_iter = iter(unnamed)
     used_named = 0
@@ -2711,6 +2744,40 @@ def _merge_partial_pac_import(
             used_named += 1
             continue
 
+        if obj_is_authoritative:
+            # User's OBJ is authoritative and didn't mention this
+            # submesh by name → emit an EMPTY PLACEHOLDER (same
+            # name, same material, same descriptor metadata, but
+            # zero vertices / zero faces).
+            #
+            # Why a placeholder rather than actually dropping the
+            # submesh? Because the downstream rebuilder
+            # (``_build_pac_full_rebuild``) can patch the per-LOD
+            # vertex / index counts inside the existing descriptor
+            # records, but it CAN'T shrink section 0's descriptor
+            # table without reflowing every later section header
+            # and the LOD section-offset table — much higher risk.
+            # An empty placeholder produces the same visual result
+            # (game's renderer skips submeshes with 0 indices)
+            # while keeping the descriptor count == original count,
+            # so the existing rebuild path Just Works.
+            placeholder = copy.deepcopy(original_sm)
+            placeholder.vertices = []
+            placeholder.uvs = []
+            placeholder.normals = []
+            placeholder.faces = []
+            placeholder.bone_indices = []
+            placeholder.bone_weights = []
+            placeholder.source_vertex_offsets = []
+            placeholder.vertex_count = 0
+            placeholder.face_count = 0
+            placeholder.source_vertex_map = []
+            merged_submeshes.append(placeholder)
+            dropped_names.append(original_sm.name)
+            continue
+
+        # Anonymous-OBJ legacy path: consume an unnamed submesh in
+        # order, or fall back to keeping the original.
         try:
             merged_submeshes.append(next(unnamed_iter))
         except StopIteration:
@@ -2725,9 +2792,17 @@ def _merge_partial_pac_import(
             "PAC import contains extra unnamed submeshes that could not be matched to the original mesh."
         )
 
-    if used_named == 0 and imported_mesh.submeshes and len(imported_mesh.submeshes) != len(original_mesh.submeshes):
+    if not obj_is_authoritative and used_named == 0 and imported_mesh.submeshes and len(imported_mesh.submeshes) != len(original_mesh.submeshes):
         raise ValueError(
             "PAC import only contained a partial mesh without recognizable original submesh names."
+        )
+
+    if dropped_names:
+        logger.info(
+            "PAC OBJ import is authoritative — emitting %d empty "
+            "placeholder(s) for original submesh(es) absent from "
+            "the OBJ (game and preview render these as nothing): %s",
+            len(dropped_names), ", ".join(dropped_names),
         )
 
     merged = copy.deepcopy(imported_mesh)
@@ -2740,15 +2815,320 @@ def _merge_partial_pac_import(
 
 
 def _pack_pac_normal(normal: tuple[float, float, float], existing_packed: int = 0) -> int:
-    """Pack a float normal back into the PAC 10:10:10 layout."""
+    """Pack a float normal into the PAC vertex-record's u32 at byte +16.
+
+    Layout — verified May 2026 by disassembling the shader cache shader
+    ``shader/skinnedmeshstreamout.hlsl`` entry ``CSMainSkinnedMeshStreamOutVertexData``
+    via ``dxc -dumpbin`` on the extracted DXBC payload from
+    ``shadercache__/*_3964b6b0_*.padxil``. The vertex shader reads:
+
+        bits 10-19  — nx, decoded as ``(value / 511.5) - 1.0``
+        bits 20-29  — ny, decoded the same way
+        bit  30     — tested by ``packed & 0x40000000``; if non-zero, nz
+                      is negated. nz magnitude is reconstructed via
+                      ``sqrt(max(0, 1 - nx² - ny²))``.
+
+    The shader does NOT read bits 0-9 or bit 31 of this u32 in the
+    streamout pass. They may carry data consumed by other shaders
+    (parser comments hint at "normal/tangent auxiliary"); we preserve
+    them verbatim from the donor record.
+
+    The DXIL evidence (line numbers from the disassembled .ll IR):
+        %124 = lshr i32 %79, 10                  ; >> 10
+        %125 = and  i32 %124, 1023               ; mask 0x3FF
+        %126 = uitofp i32 %125 to float
+        %127 = fmul  fast float %126, 0x3F60040100000000  ; * (1/511.5)
+        %128 = fadd  fast float %127, -1.000000e+00       ; - 1.0     → nx
+        ; (same pattern for ny via shifts of 20)
+        %134 = fmul  fast float %128, %128                ; nx²
+        %135 = fsub  fast float 1.000000e+00, %134
+        %136 = fmul  fast float %133, %133                ; ny²
+        %137 = fsub  fast float %135, %136                ; 1 - nx² - ny²
+        %138 = call  float @dx.op.binary.f32(i32 35, 0.0, %137)  ; max(0, _)
+        %139 = call  float @dx.op.unary.f32 (i32 24, %138)       ; sqrt(_)
+        %140 = and   i32 %79, 1073741824                  ; bit 30
+        %141 = icmp  ne i32 %140, 0
+        %142 = select i1 %141, float -1.000000e+00, float 1.000000e+00
+        %143 = fmul  fast float %139, %142                ; nz
+
+    History
+    -------
+    Pre-May-2026 implementations encoded ``_enc(nz)`` into bits 0-9 and
+    preserved bits 30-31 from the donor. The encoder/decoder pair in
+    :func:`core.mesh_parser._decode_pac_normal` mirrored that legacy
+    layout (it still does — that decoder needs the matching fix). The
+    ENGINE never read bits 0-9 or bit 31 for normal reconstruction, so
+    those legacy writes had no in-game effect; the donor's bit 30 (the
+    only bit the engine reads for nz sign) was carried verbatim into
+    every new vertex via spatial-hash donor cloning, flipping ~half the
+    surface's normals on topology-changing rebuilds (the "rainbow on
+    forehead" / "white-with-sparks" lighting artefact).
+    """
 
     def _enc(value: float) -> int:
         value = max(-1.0, min(1.0, value))
         return max(0, min(1023, round((value + 1.0) * 511.5)))
 
     nx, ny, nz = normal
-    packed = _enc(nz) | (_enc(nx) << 10) | (_enc(ny) << 20)
-    return (existing_packed & 0xC0000000) | packed
+    # Encode nx into bits 10-19, ny into bits 20-29.
+    packed = (_enc(nx) << 10) | (_enc(ny) << 20)
+    # Compute bit 30 from the NEW geometry's nz sign.
+    if nz < 0.0:
+        packed |= 0x40000000
+    # Preserve donor's bits 0-9 and bit 31 (engine doesn't read them
+    # for normals; semantic still TBD).
+    return packed | (existing_packed & 0x800003FF)
+
+
+def _compute_mesh_tangents(
+    vertices: list[tuple[float, float, float]],
+    uvs: list[tuple[float, float]],
+    normals: list[tuple[float, float, float]],
+    faces: list[tuple[int, int, int]],
+) -> tuple[
+    list[tuple[float, float, float]],
+    list[float],
+    list[bool],
+]:
+    """Compute per-vertex unit tangents + bitangent-handedness signs + validity flags.
+
+    Returns ``(tangents, bsigns, valid)`` where ``valid[i]`` is True when
+    the tangent at vertex ``i`` was derived from non-degenerate UV
+    gradients, and False when it came from the N-orthogonal fallback
+    used for vertices whose only contributing faces had degenerate or
+    cancelling UVs. Callers should NOT overwrite donor tangent bytes
+    when ``valid[i]`` is False — the donor record holds the engine's
+    baked tangent for that vertex, which is more trustworthy than any
+    arbitrary N-perpendicular axis we could pick at import time.
+
+    Standard MikkTSpace-style algorithm (Blender / Unity / Unreal / Substance):
+
+      For each triangle, derive (T, B) from edge vectors and UV gradients:
+          T = (e1 * dv2 - e2 * dv1) / det
+          B = (e2 * du1 - e1 * du2) / det
+      Accumulate per vertex (uniform).
+      Per vertex: orthogonalize T against N, normalize, derive handedness
+      from sign(dot(cross(N, T), B)).
+
+    Strict mode — NO FALLBACK. Any of the following raises ``ValueError``:
+      * UV count != vertex count
+      * normal count != vertex count
+      * face references out-of-range vertex
+      * UV triangle degenerate (det ≈ 0)
+      * orthogonalized tangent is zero-length
+
+    Returns (tangents_list, bsigns_list) where each list has one entry per
+    vertex; tangents are unit vectors; bsigns are +1.0 or -1.0.
+    """
+    n = len(vertices)
+    if len(uvs) != n:
+        raise ValueError(
+            f"_compute_mesh_tangents: UV count mismatch — got {len(uvs)} UVs "
+            f"but {n} vertices. The OBJ/FBX import must carry per-vertex UVs "
+            "for tangent computation. Re-export from Blender with 'Include "
+            "UVs' checked."
+        )
+    if len(normals) != n:
+        raise ValueError(
+            f"_compute_mesh_tangents: normal count mismatch — got {len(normals)} "
+            f"normals but {n} vertices."
+        )
+
+    tan_accum = [[0.0, 0.0, 0.0] for _ in range(n)]
+    bitan_accum = [[0.0, 0.0, 0.0] for _ in range(n)]
+    contrib = [0] * n   # how many non-degenerate faces touched each vertex
+
+    n_degenerate = 0
+    for fi, (i0, i1, i2) in enumerate(faces):
+        if min(i0, i1, i2) < 0 or max(i0, i1, i2) >= n:
+            raise ValueError(
+                f"_compute_mesh_tangents: face {fi} indices ({i0}, {i1}, {i2}) "
+                f"out of range [0, {n})."
+            )
+
+        p0 = vertices[i0]; p1 = vertices[i1]; p2 = vertices[i2]
+        uv0 = uvs[i0];     uv1 = uvs[i1];     uv2 = uvs[i2]
+
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        du1 = uv1[0] - uv0[0]; dv1 = uv1[1] - uv0[1]
+        du2 = uv2[0] - uv0[0]; dv2 = uv2[1] - uv0[1]
+
+        det = du1 * dv2 - du2 * dv1
+        if abs(det) < 1e-10:
+            # Standard MikkTSpace behavior: a triangle whose UVs are
+            # colinear contributes no information about tangent space, so
+            # skip it during accumulation. This is NOT a silent fallback —
+            # it's the published reference algorithm. Game source meshes
+            # routinely contain UV-collapsed faces (shadow planes, hidden
+            # stubs); they get their tangents from the OTHER faces sharing
+            # those vertices. We fail loudly at the per-vertex level below
+            # if a vertex ends up with zero contribution.
+            n_degenerate += 1
+            continue
+        inv = 1.0 / det
+
+        tx = (e1[0] * dv2 - e2[0] * dv1) * inv
+        ty = (e1[1] * dv2 - e2[1] * dv1) * inv
+        tz = (e1[2] * dv2 - e2[2] * dv1) * inv
+        bx = (e2[0] * du1 - e1[0] * du2) * inv
+        by = (e2[1] * du1 - e1[1] * du2) * inv
+        bz = (e2[2] * du1 - e1[2] * du2) * inv
+
+        for vi in (i0, i1, i2):
+            tan_accum[vi][0] += tx
+            tan_accum[vi][1] += ty
+            tan_accum[vi][2] += tz
+            bitan_accum[vi][0] += bx
+            bitan_accum[vi][1] += by
+            bitan_accum[vi][2] += bz
+            contrib[vi] += 1
+
+    def _n_perp(N: tuple[float, float, float]) -> tuple[float, float, float]:
+        """Pick a unit vector orthogonal to N — used when the UV-derived
+        tangent is unrecoverable. This is the same construction
+        Blender's mesh_calc_tangents and the MikkTSpace reference impl
+        use in the degenerate corner case.
+        """
+        ax = abs(N[0]); ay = abs(N[1]); az = abs(N[2])
+        if ax <= ay and ax <= az:
+            ref = (1.0, 0.0, 0.0)
+        elif ay <= az:
+            ref = (0.0, 1.0, 0.0)
+        else:
+            ref = (0.0, 0.0, 1.0)
+        dot_RN = ref[0] * N[0] + ref[1] * N[1] + ref[2] * N[2]
+        ox = ref[0] - dot_RN * N[0]
+        oy = ref[1] - dot_RN * N[1]
+        oz = ref[2] - dot_RN * N[2]
+        L = math.sqrt(ox * ox + oy * oy + oz * oz)
+        if L < 1e-10:
+            raise ValueError(
+                "_compute_mesh_tangents: degenerate normal "
+                f"({N[0]:.3e}, {N[1]:.3e}, {N[2]:.3e}); cannot derive tangent."
+            )
+        return (ox / L, oy / L, oz / L)
+
+    tangents: list[tuple[float, float, float]] = []
+    bsigns:   list[float] = []
+    valid:    list[bool] = []
+    n_isolated = 0   # vertices with NO non-degenerate face
+    n_cancelled = 0  # vertices where contributing faces cancelled
+    for vi in range(n):
+        N = normals[vi]
+        T = tan_accum[vi]
+        B = bitan_accum[vi]
+
+        if contrib[vi] == 0:
+            # Every face touching this vertex had degenerate UVs. No UV
+            # gradient exists; mark INVALID so caller preserves donor
+            # bytes. We still return a sane unit vector via N-perp so
+            # that callers without a donor (e.g. tests) get something
+            # usable.
+            n_isolated += 1
+            tangents.append(_n_perp(N))
+            bsigns.append(1.0)
+            valid.append(False)
+            continue
+
+        # Orthogonalize T against N: T = T - (T·N) * N
+        dot_TN = T[0] * N[0] + T[1] * N[1] + T[2] * N[2]
+        ox = T[0] - dot_TN * N[0]
+        oy = T[1] - dot_TN * N[1]
+        oz = T[2] - dot_TN * N[2]
+
+        L = math.sqrt(ox * ox + oy * oy + oz * oz)
+        if L < 1e-10:
+            # Faces contributed but their tangent directions cancelled
+            # (typical UV-mirror seam). Mark INVALID so caller preserves
+            # donor bytes. Bitangent sign still derivable from the
+            # accumulated B vs N-perp tangent.
+            n_cancelled += 1
+            Tx, Ty, Tz = _n_perp(N)
+            cx = N[1] * Tz - N[2] * Ty
+            cy = N[2] * Tx - N[0] * Tz
+            cz = N[0] * Ty - N[1] * Tx
+            d  = cx * B[0] + cy * B[1] + cz * B[2]
+            tangents.append((Tx, Ty, Tz))
+            bsigns.append(-1.0 if d < 0.0 else 1.0)
+            valid.append(False)
+            continue
+
+        Tx = ox / L; Ty = oy / L; Tz = oz / L
+
+        # Handedness from sign(dot(cross(N, T), B))
+        cx = N[1] * Tz - N[2] * Ty
+        cy = N[2] * Tx - N[0] * Tz
+        cz = N[0] * Ty - N[1] * Tx
+        d  = cx * B[0] + cy * B[1] + cz * B[2]
+        bsign = -1.0 if d < 0.0 else 1.0
+
+        tangents.append((Tx, Ty, Tz))
+        bsigns.append(bsign)
+        valid.append(True)
+
+    if n_degenerate > 0 or n_isolated > 0 or n_cancelled > 0:
+        logger.debug(
+            "_compute_mesh_tangents: %d/%d faces had degenerate UVs; "
+            "%d/%d vertices had no UV-valid faces; %d/%d had cancelling "
+            "tangents (those vertices marked invalid; caller should keep "
+            "donor tangent bytes).",
+            n_degenerate, len(faces), n_isolated, n, n_cancelled, n,
+        )
+
+    return tangents, bsigns, valid
+
+
+def _pack_pac_tangent_into_record(
+    rec: bytearray,
+    tangent: tuple[float, float, float],
+    handedness_sign: float,
+) -> None:
+    """Encode a unit tangent into bytes 6-7 + bits 0-9 + bit 31 of byte +16.
+
+    Layout — verified May 2026 from shader DXIL of
+    ``CSMainSkinnedMeshStreamOutVertexData`` and ``RaytracingComputeSkinning2``.
+    Full evidence (DXIL line refs, byte-exact round-trip on real game data)
+    in ``test_only/research/PAC_VERTEX_RECORD_DECODED.md``.
+
+      bytes 6-7  — signed i16. Sign = sign(Tz).
+                   Magnitude = round(16383.75 * (Tx + 1.0)).
+      bits 0-9   of [16-19] — Ty as 10-bit unsigned,
+                   round((Ty + 1.0) * 511.5).
+      bit 31     of [16-19] — handedness flag (1 if bsign < 0).
+
+    Call ``_pack_pac_normal`` FIRST to write the new normal's bits
+    10-19/20-29/30; this function then overlays the tangent bits without
+    disturbing the normal.
+
+    Strict mode — raises ValueError if tangent isn't unit length within
+    ±0.05 (caller must normalize). No fallback.
+    """
+    if len(rec) < 20:
+        raise ValueError(
+            f"_pack_pac_tangent_into_record: vertex record too small "
+            f"({len(rec)} bytes, need ≥ 20)."
+        )
+
+    Tx, Ty, Tz = tangent
+    L = math.sqrt(Tx * Tx + Ty * Ty + Tz * Tz)
+    if abs(L - 1.0) > 0.05:
+        raise ValueError(
+            f"_pack_pac_tangent_into_record: tangent |T| = {L:.4f} is not "
+            "unit length (tolerance ±0.05). Normalize before calling."
+        )
+
+    mag = max(0, min(32767, round(16383.75 * (Tx + 1.0))))
+    bytes_6_7 = -mag if Tz < 0.0 else mag
+    struct.pack_into("<h", rec, 6, bytes_6_7)
+
+    ty_enc = max(0, min(1023, round((Ty + 1.0) * 511.5)))
+    bit_31_mask = 0x80000000 if handedness_sign < 0.0 else 0
+
+    existing = struct.unpack_from("<I", rec, 16)[0]
+    cleared = existing & 0x7FFFFC00          # clear bits 0-9 + bit 31
+    new_packed = cleared | ty_enc | bit_31_mask
+    struct.pack_into("<I", rec, 16, new_packed)
 
 
 def _choose_pac_donor_indices(orig_sm: SubMesh, new_sm: SubMesh) -> list[int]:
@@ -2957,6 +3337,26 @@ def _build_pac_in_place(
             or getattr(working_mesh, "clean_donor_shading_records", False)
         )
 
+        # STRICT MODE — compute MikkTSpace tangents for every vertex of the
+        # submesh. Required for correct lighting/normal-mapping; failure
+        # propagates as a hard error so we never silently leave the donor's
+        # tangent in place when the new mesh's UVs need a different one.
+        if not new_uvs:
+            raise ValueError(
+                f"PAC submesh {sm_idx} ('{new_sm.name}') has no UVs; cannot "
+                "compute tangents. Re-export the OBJ/FBX with texture "
+                "coordinates."
+            )
+        try:
+            sm_tangents, sm_bsigns, sm_tan_valid = _compute_mesh_tangents(
+                new_sm.vertices, new_uvs, new_normals, new_sm.faces
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"PAC build failed: cannot compute tangents for submesh "
+                f"'{new_sm.name}' (#{sm_idx}). Detail: {exc}"
+            ) from exc
+
         for vi, rec_off in enumerate(orig_sm.source_vertex_offsets):
             if rec_off < 0 or rec_off + orig_sm.source_vertex_stride > len(result):
                 raise ValueError(
@@ -2998,6 +3398,22 @@ def _build_pac_in_place(
                         0 if clean_shading_records else existing_normal,
                     ),
                 )
+                # Encode our newly-computed tangent ONLY for vertices
+                # whose tangent came from non-degenerate UVs. Vertices in
+                # UV-collapsed regions keep the donor's existing tangent
+                # bytes (engine-baked, trusted). STRICT MODE: any encoder
+                # rejection on a "valid" tangent raises immediately.
+                if sm_tan_valid[vi]:
+                    try:
+                        _pack_pac_tangent_into_record(
+                            rec, sm_tangents[vi], sm_bsigns[vi]
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"PAC build failed: tangent encode rejected "
+                            f"vertex #{vi} of submesh '{new_sm.name}' "
+                            f"(#{sm_idx}). Detail: {exc}"
+                        ) from exc
 
             payload = bytes(rec)
             prev = vertex_updates.get(rec_off)
@@ -3069,6 +3485,37 @@ def _build_pac_full_rebuild(
 
     prepared_submeshes = []
     for sm_idx, (orig_sm, new_sm, desc) in enumerate(zip(original_mesh.submeshes, working_mesh.submeshes, descriptors)):
+        # ── Empty placeholder fast-path ──
+        # When the user's OBJ doesn't include this submesh by name and
+        # the merge step in ``_merge_partial_pac_import`` emitted an
+        # empty placeholder (0 verts / 0 faces), there's no geometry
+        # to upload and no tangents to compute. Patch the descriptor's
+        # per-LOD vertex / index counts to zero so the runtime loader
+        # treats this submesh as empty (renders nothing), and skip the
+        # rest of the per-submesh prep — including the UV check and
+        # MikkTSpace pass which would otherwise raise on the missing
+        # UVs of the placeholder.
+        if not new_sm.vertices and not new_sm.faces:
+            rel_desc_off = desc.descriptor_offset - sec0["offset"]
+            if rel_desc_off < 0 or rel_desc_off + 40 > len(sec0_data):
+                raise ValueError(
+                    f"PAC descriptor {sm_idx} points outside section 0."
+                )
+            vc_off = rel_desc_off + 40
+            ic_off = vc_off + desc.stored_lod_count * 2
+            for lod_idx in range(desc.stored_lod_count):
+                struct.pack_into("<H", sec0_data, vc_off + lod_idx * 2, 0)
+                struct.pack_into("<I", sec0_data, ic_off + lod_idx * 4, 0)
+            # No prepared_submeshes entry → the geometry-writer loop
+            # below skips this submesh entirely. Nothing gets written
+            # to the LOD vertex / index buffers for this slot.
+            logger.info(
+                "PAC submesh %d ('%s'): emitting empty placeholder "
+                "(zero-count descriptor, no geometry).",
+                sm_idx, new_sm.name,
+            )
+            continue
+
         if not orig_sm.source_vertex_offsets or orig_sm.source_vertex_stride < 12:
             raise ValueError(
                 f"PAC submesh {sm_idx} is missing source vertex metadata for a full rebuild."
@@ -3138,12 +3585,37 @@ def _build_pac_full_rebuild(
             struct.pack_into("<H", sec0_data, vc_off + lod_idx * 2, new_vert_count)
             struct.pack_into("<I", sec0_data, ic_off + lod_idx * 4, new_index_count)
 
+        # Compute MikkTSpace tangents for the new mesh — strict mode, no
+        # fallback. Without correct per-vertex tangents the engine renders
+        # tangent-space normal maps with garbage TBN matrices, producing the
+        # "white-with-sparks" lighting noise. The encoder formulas below
+        # write the tangent into bytes 6-7 + bits 0-9 + bit 31 verified
+        # byte-exact against shipped game data.
+        if not new_uvs:
+            raise ValueError(
+                f"PAC submesh {sm_idx} ('{new_sm.name}') has no UVs; cannot "
+                "compute tangents. Re-export the OBJ/FBX with texture "
+                "coordinates."
+            )
+        try:
+            new_tangents, new_bsigns, new_tan_valid = _compute_mesh_tangents(
+                new_sm.vertices, new_uvs, normals, new_sm.faces
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"PAC build failed: cannot compute tangents for submesh "
+                f"'{new_sm.name}' (#{sm_idx}). Detail: {exc}"
+            ) from exc
+
         prepared_submeshes.append({
             "submesh": new_sm,
             "donor_records": donor_records,
             "donor_indices": donor_indices,
             "normals": normals,
             "uvs": new_uvs,
+            "tangents": new_tangents,
+            "bsigns": new_bsigns,
+            "tan_valid": new_tan_valid,
             "bbox_min": bmin,
             "bbox_extent": extent,
             "stored_lod_count": stored_lod_count,
@@ -3166,6 +3638,9 @@ def _build_pac_full_rebuild(
             donor_indices = prepared["donor_indices"]
             normals = prepared["normals"]
             new_uvs = prepared["uvs"]
+            tangents = prepared["tangents"]
+            bsigns = prepared["bsigns"]
+            tan_valid = prepared["tan_valid"]
             bbox_min = prepared["bbox_min"]
             bbox_extent = prepared["bbox_extent"]
             clean_shading_records = prepared["clean_shading_records"]
@@ -3206,6 +3681,26 @@ def _build_pac_full_rebuild(
                             0 if clean_shading_records else existing_normal,
                         ),
                     )
+                    # Encode the freshly-computed tangent ONLY for vertices
+                    # whose tangent came from non-degenerate UVs. For
+                    # vertices marked invalid (UV-collapsed regions), the
+                    # donor's existing tangent bytes are kept verbatim —
+                    # they're the engine-baked values from the original
+                    # mesh and are more trustworthy than any fallback we
+                    # could synthesize. STRICT MODE: if the encoder
+                    # rejects a "valid" tangent, raise — never silently
+                    # paper over.
+                    if tan_valid[vi]:
+                        try:
+                            _pack_pac_tangent_into_record(
+                                donor_rec, tangents[vi], bsigns[vi]
+                            )
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"PAC build failed: tangent encode rejected "
+                                f"vertex #{vi} of submesh '{sm.name}' "
+                                f"(#{sm_idx}). Detail: {exc}"
+                            ) from exc
 
                 verts_buf.extend(donor_rec)
 

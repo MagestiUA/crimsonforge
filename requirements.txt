@@ -1,5 +1,14 @@
 PySide6>=6.7.0
 PyOpenGL>=3.1.0
+# Native-C accelerator for PyOpenGL — wraps the hot per-call paths
+# in CPython extensions and removes the "OpenGL_accelerate module
+# loaded: No" line from the startup log. Wheels are available for
+# every shipping CPython including 3.14 (verified against
+# pyopengl_accelerate-3.1.10-cp314-cp314-win_amd64.whl). Without
+# it the app still runs — it just falls back to pure-Python
+# OpenGL bindings — but the Explorer's mesh-preview upload path
+# benefits noticeably from the accelerator.
+PyOpenGL_accelerate>=3.1.10
 lz4>=4.3.0
 cryptography>=42.0.0
 fonttools>=4.50.0

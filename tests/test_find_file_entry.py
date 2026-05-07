@@ -25,6 +25,7 @@ from core.pamt_parser import (   # noqa: E402
     PamtData,
     PamtFileEntry,
     find_file_entry,
+    find_all_file_entries,
 )
 
 
@@ -227,6 +228,63 @@ class AmbiguousBasenames(unittest.TestCase):
         ])
         e = find_file_entry(pamt, "b/shared.wem")
         self.assertEqual(e.path, "b/shared.wem")
+
+
+class ShortcutAliasResolution(unittest.TestCase):
+    """Bug 2026-05-04: shipping PAMTs contain BOTH a shortcut alias
+    AND the real nested entry for the same basename. The runtime
+    loader uses the nested path; patching the shortcut updates an
+    alias the game ignores. Resolved by picking the LONGEST matching
+    path, not the first."""
+
+    def test_shortcut_aliases_lose_to_nested_real_path(self):
+        # Helmet 0363 — exact case observed in shipping data.
+        pamt = _pamt([
+            # Shortcut alias appears FIRST in the entry list:
+            "character/cd_phm_00_hel_00_0363.pac",
+            # ...real nested path appears later:
+            "character/model/1_pc/1_phm/armor/13_hel/"
+            "cd_phm_00_hel_00_0363.pac",
+        ])
+        e = find_file_entry(pamt, "cd_phm_00_hel_00_0363.pac")
+        self.assertEqual(
+            e.path,
+            "character/model/1_pc/1_phm/armor/13_hel/"
+            "cd_phm_00_hel_00_0363.pac",
+            "Basename-only lookup must pick the deepest path. "
+            "Shortcut alias picked = wrong-target patch bug.",
+        )
+
+    def test_deepest_wins_even_when_shortcut_appears_last(self):
+        # Same fix must work regardless of entry order.
+        pamt = _pamt([
+            "deep/deeper/deepest/foo.pac",
+            "shallow/foo.pac",
+            "deep/foo.pac",
+        ])
+        e = find_file_entry(pamt, "foo.pac")
+        self.assertEqual(e.path, "deep/deeper/deepest/foo.pac")
+
+    def test_find_all_returns_every_match_deepest_first(self):
+        pamt = _pamt([
+            "character/cd_phm_00_hel_00_0363.pac",
+            "character/model/1_pc/1_phm/armor/13_hel/"
+            "cd_phm_00_hel_00_0363.pac",
+            "unrelated/other.pac",
+        ])
+        all_matches = find_all_file_entries(
+            pamt, "cd_phm_00_hel_00_0363.pac",
+        )
+        self.assertEqual(len(all_matches), 2,
+                         "Both alias and real path must be returned.")
+        self.assertGreater(
+            len(all_matches[0].path), len(all_matches[1].path),
+            "First match must be the deepest path.",
+        )
+
+    def test_find_all_empty_when_no_match(self):
+        pamt = _pamt(["a/b.pac", "c/d.pac"])
+        self.assertEqual(find_all_file_entries(pamt, "missing.pac"), [])
 
 
 if __name__ == "__main__":

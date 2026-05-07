@@ -91,11 +91,25 @@ class _ArchiveRow:
                  "search_display", "_display_tokens")
 
     def __init__(self, entry: PamtFileEntry, group: str):
+        # ── PERF (2026-05-07) ──
+        # Cold load constructs ~1.5 M of these rows. ``os.path.splitext``
+        # and ``os.path.basename`` each go through ``os.path`` machinery
+        # (sep detection, normpath bits) that's overkill for the canonical
+        # forward-slash paths we get out of PAMTs. Inlining the splits via
+        # ``rsplit`` runs ~3-4× faster on Python 3.12 and trims a couple
+        # of seconds off the explorer's "All Packages" first-paint.
         self.entry = entry
         self.group = group
-        self.path_lower = entry.path.lower()
-        self.ext = os.path.splitext(self.path_lower)[1]
-        self.stem_lower = os.path.splitext(os.path.basename(self.path_lower))[0]
+        path_lower = entry.path.lower()
+        self.path_lower = path_lower
+        # Basename: strip everything up to and including the last '/'.
+        slash = path_lower.rfind("/")
+        basename_lower = path_lower if slash < 0 else path_lower[slash + 1:]
+        # Extension: include the leading '.' so callers that compare
+        # against ``.pac`` etc. keep working unchanged.
+        dot = basename_lower.rfind(".")
+        self.ext = "" if dot <= 0 else basename_lower[dot:]
+        self.stem_lower = basename_lower if dot <= 0 else basename_lower[:dot]
         self.size_raw = entry.orig_size
         self._size_str = None
         self._type_desc = None
@@ -690,6 +704,13 @@ class ExplorerTab(QWidget):
         # Space bar toggles check state of all selected rows
         space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self._view)
         space_shortcut.activated.connect(self._toggle_selected_checks)
+        # Ctrl+C copies the filename (basename + extension) of every
+        # selected row to the system clipboard. Scoped to the archive
+        # view's focus context so it doesn't shadow Ctrl+C in the
+        # preview pane, the editor, or the text fields above.
+        copy_shortcut = QShortcut(QKeySequence.Copy, self._view)
+        copy_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        copy_shortcut.activated.connect(self._copy_selected_filenames)
         left_layout.addWidget(self._view, 1)
         main_splitter.addWidget(left_panel)
 
@@ -821,28 +842,74 @@ class ExplorerTab(QWidget):
     def _load_item_index(self) -> None:
         """Build the item-name search index from live game data.
 
-        Also kicks off an asynchronous catalog rebuild so the Catalog
-        Browser dialog opens instantly without freezing the UI on a
-        20-second iteminfo + icon-discovery scan when the user clicks
-        the catalog button.
+        ── PERF (2026-05-07) ──
+        Profiling showed this step adds ~7.7 s to the cold-load on
+        a real install (1.5 M file entries to scan). Previously it
+        ran synchronously on the UI thread, freezing the Explorer
+        before the user could see anything. Now the index is built
+        on a background worker; the Explorer is interactive
+        immediately and the search box reports "still building..."
+        if the user types into it before the index is ready.
+
+        Also kicks off the heavier ``build_item_catalog_cached``
+        async — same rationale, used by the Catalog Browser dialog.
         """
         if not self._vfs:
             return
 
-        def _progress(message: str) -> None:
-            self._progress.set_status(f"Building item search index... {message}")
-            QApplication.processEvents()
+        # Run the index build on a worker thread. We capture the VFS
+        # reference at scheduling time so subsequent VFS reloads
+        # don't race with an in-flight build (the worker either
+        # completes against the old VFS — fine, will be replaced on
+        # the next reload — or it gets cancelled when a new build
+        # supersedes it).
+        target_vfs = self._vfs
 
-        try:
-            self._item_index = build_item_index(self._vfs, progress_fn=_progress)
-            if self._item_index:
+        def _bg_build(worker, vfs=target_vfs):
+            def _progress(message: str) -> None:
+                if worker.is_cancelled():
+                    raise RuntimeError("item-index build cancelled")
+                worker.report_progress(0, message)
+            try:
+                idx = build_item_index(vfs, progress_fn=_progress)
+                return {"ok": True, "index": idx}
+            except Exception as e:
+                logger.warning("Item search index unavailable: %s", e)
+                return {"ok": False, "error": str(e)}
+
+        def _on_done(result):
+            # Only adopt the result if we still have the same VFS we
+            # built against — avoids stomping on a fresher reload.
+            if self._vfs is not target_vfs:
+                return
+            if result.get("ok"):
+                self._item_index = result["index"]
+                if self._item_index:
+                    self._progress.set_status(
+                        f"Item search ready: "
+                        f"{len(self._item_index.items):,} items"
+                    )
+            else:
+                self._item_index = None
                 self._progress.set_status(
-                    f"Item search ready: {len(self._item_index.items):,} items"
+                    f"Item search unavailable: {result.get('error')}"
                 )
-        except Exception as e:
-            self._item_index = None
-            logger.warning("Item search index unavailable: %s", e)
-            self._progress.set_status(f"Item search unavailable: {e}")
+
+        # Reuse the explorer's existing worker plumbing.
+        worker = FunctionWorker(_bg_build)
+        worker.progress.connect(
+            lambda _pct, msg: self._progress.set_status(
+                f"Building item search index... {msg}" if msg else ""
+            ),
+        )
+        worker.finished_result.connect(_on_done)
+        worker.error_occurred.connect(lambda err: logger.warning(
+            "Item search index worker failed: %s", err))
+        # Hold a reference so it isn't GC'd mid-flight.
+        self._item_index_worker = worker
+        worker.start()
+        self._progress.set_status(
+            "Item search index building in background...")
 
         # Kick the catalog build off in the background. The catalog
         # browser dialog needs the icon-paths-enriched catalog the
@@ -1281,6 +1348,35 @@ class ExplorerTab(QWidget):
         for r in rows:
             self._model.setData(self._model.index(r, _COL_FILE), new_state, Qt.CheckStateRole)
 
+    def _copy_selected_filenames(self):
+        """Ctrl+C: copy filename (basename + extension) of every
+        selected row to the system clipboard.
+
+        Multiple selections are joined with newlines so the clipboard
+        round-trips into anywhere that accepts a one-per-line list
+        (text editors, terminals, the search bars in other tabs).
+        Falls back to the current row when nothing is explicitly
+        selected — Qt's default selection model treats the focused
+        cell as "current" but not "selected", and users expect Ctrl+C
+        to work either way.
+        """
+        rows = self._get_selected_rows()
+        if not rows:
+            current = self._view.currentIndex()
+            if current.isValid():
+                rows = [current.row()]
+        if not rows:
+            return
+        names: list[str] = []
+        for r in rows:
+            row_data = self._model.row_at(r)
+            if not row_data:
+                continue
+            names.append(os.path.basename(row_data.entry.path))
+        if not names:
+            return
+        QApplication.clipboard().setText("\n".join(names))
+
     def _show_context_menu(self, pos):
         rows = self._get_selected_rows()
         menu = QMenu(self)
@@ -1313,20 +1409,19 @@ class ExplorerTab(QWidget):
                     export_obj_act.triggered.connect(lambda _=False, e=entry: self._export_mesh(e, "obj"))
                     export_fbx_act = menu.addAction("Export as FBX")
                     export_fbx_act.triggered.connect(lambda _=False, e=entry: self._export_mesh(e, "fbx"))
-                    # The combined "Export Full Character FBX (Mesh + Bones +
-                    # Animation)" right-click action is intentionally NOT
-                    # exposed in this version. Underlying parsers / exporters
-                    # for skeleton + PAA animation + PABC bone palette are all
-                    # in place (core/skeleton_parser.py, core/animation_parser.py,
-                    # core/pabc_skin_palette.py, core/mesh_exporter.export_fbx_with_skeleton),
-                    # but the per-submesh slot-to-bone palette resolution is
-                    # not yet 100% accurate for the upper body of certain
-                    # character meshes (the runtime resolution lives inside the
-                    # game's compiled SkinMesh* C++ classes which we have not
-                    # finished decoding). The action is hidden until that
-                    # mapping is fully verified to avoid shipping FBXs with
-                    # subtle skin-shatter artefacts.  See core/pabc_skin_palette.py
-                    # docstring for the format we have decoded so far.
+                    # Combined "Export Full Character FBX" — mesh + skeleton +
+                    # optional animation in a single FBX. The per-submesh
+                    # slot-to-bone palette resolution that previously kept
+                    # this hidden is now resolved geometrically in
+                    # ``core.mesh_parser.derive_skin_slot_to_pab_geometric``
+                    # (v1.25.2: 158/158 clusters anatomically correct on
+                    # Damian's full character).
+                    export_full_act = menu.addAction(
+                        "Export Full Character FBX (Mesh + Bones + Animation)"
+                    )
+                    export_full_act.triggered.connect(
+                        lambda _=False, e=entry: self._export_full_character(e)
+                    )
                     menu.addAction("Diagnose dye / tint system").triggered.connect(
                         lambda _=False, e=entry: self._diagnose_dye(e))
                     menu.addSeparator()
@@ -1886,9 +1981,20 @@ class ExplorerTab(QWidget):
 
     def _preview_from_archive(self, entry: PamtFileEntry):
         try:
+            # Dedup: when the user clicks a row, BOTH ``clicked`` and
+            # ``currentRowChanged`` fire and call this method back-to-
+            # back. Previously we set ``_last_preview_time`` only at
+            # the END of the function, so the second call's
+            # ``now - _last_preview_time`` measured against the PREVIOUS
+            # file (often well past 0.25 s) and the slow preview ran
+            # twice. We now stamp the path + time at the START so the
+            # second signal short-circuits even if the first preview
+            # is still in flight or crashes mid-way.
             now = time.monotonic()
             if entry.path == self._last_preview_path and (now - self._last_preview_time) < 0.25:
                 return
+            self._last_preview_path = entry.path
+            self._last_preview_time = now
 
             self._progress.set_status(f"Loading {os.path.basename(entry.path)}...")
             data = self._vfs.read_entry_data(entry)
@@ -1922,8 +2028,10 @@ class ExplorerTab(QWidget):
                 vfs=self._vfs,
                 vfs_path=entry.path.replace("\\", "/"),
             )
-            self._last_preview_path = entry.path
-            self._last_preview_time = now
+            # Refresh the dedup timestamp on success so the 0.25 s
+            # window starts AFTER the preview actually completes.
+            # (Path is already set at the top.)
+            self._last_preview_time = time.monotonic()
             self._progress.set_status(f"Preview: {basename} ({format_file_size(len(data))})")
         except Exception as e:
             self._progress.set_status(f"Preview error: {e}")

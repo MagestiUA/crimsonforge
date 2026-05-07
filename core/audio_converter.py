@@ -91,9 +91,38 @@ def wem_to_wav(wem_path: str, output_path: str = "") -> str:
         if result.returncode == 0 and os.path.isfile(output_path):
             logger.info("Converted WEM to WAV: %s -> %s", wem_path, output_path)
             return output_path
+
+        # ── Better diagnostics for BNK previews (2026-05-08) ──
+        # BNK = Wwise SoundBank, a CONTAINER of streams. vgmstream
+        # opens it but can fail when the bank uses Crimson Desert's
+        # encryption variant or when the requested sub-stream index
+        # is out of range. The previous error log was a single line
+        # of stderr, which buried the actual cause. Now we surface
+        # the file path + size + sub-stream count hint so the next
+        # preview attempt can be targeted, and we log at WARNING
+        # rather than ERROR (the app keeps working — only this one
+        # preview failed; ERROR level scares users into thinking the
+        # whole audio pipeline is broken).
+        ext = os.path.splitext(wem_path.lower())[1]
+        if ext == ".bnk":
+            try:
+                size = os.path.getsize(wem_path)
+            except OSError:
+                size = -1
+            logger.warning(
+                "BNK preview unavailable for %s (%d bytes). "
+                "vgmstream stderr: %s. "
+                "Crimson Desert ships some BNKs in Wwise's encrypted "
+                "form which this vgmstream build can't decode. "
+                "Single-WEM previews continue to work — only the "
+                "in-bank streams of this specific BNK are affected.",
+                os.path.basename(wem_path), size,
+                result.stderr.strip().splitlines()[0]
+                if result.stderr.strip() else "(empty)",
+            )
         else:
             logger.error("vgmstream failed: %s", result.stderr)
-            return ""
+        return ""
     except Exception as e:
         logger.error("WEM to WAV conversion error: %s", e)
         return ""
