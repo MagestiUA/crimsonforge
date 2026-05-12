@@ -168,14 +168,30 @@ class Clause:
         value: the literal text (lowercased for case-insensitive)
         field: only set for kind='field' — the field name
         negated: if True, this clause MUST NOT match
+        compiled: pre-compiled regex for wildcard clauses (None
+            otherwise). Cached once at parse time so the explorer's
+            1.4M-row loop doesn't recompile fnmatch's regex per row.
     """
-    __slots__ = ("kind", "value", "field", "negated")
+    __slots__ = ("kind", "value", "field", "negated", "compiled")
 
     def __init__(self, kind: str, value: str, field: str = "", negated: bool = False):
         self.kind = kind
         self.value = value
         self.field = field
         self.negated = negated
+        self.compiled = None
+        if kind == "wildcard":
+            import fnmatch as _fn
+            import re as _re
+            try:
+                self.compiled = _re.compile(
+                    _fn.translate(value), _re.IGNORECASE,
+                )
+            except Exception:
+                # Malformed glob — leave compiled=None so callers
+                # can fall back to fnmatch.fnmatch (which still
+                # produces a sensible 'no match' for bad input).
+                self.compiled = None
 
     def __repr__(self) -> str:
         n = "!" if self.negated else ""
@@ -325,6 +341,23 @@ def _make_clause(tok: str, negated: bool) -> Clause | None:
     if "*" in tok or "?" in tok:
         return Clause("wildcard", tok.lower(), negated=negated)
 
+    # Bare extension shortcut: tokens like ``.pac`` (3-15 chars,
+    # starts with a single ``.``, no further dots) are promoted to
+    # an EXTENSION match rather than a plain substring. Substring
+    # would let ``.pac`` match files named ``*.paccd`` /
+    # ``*.pac_xml`` / ``*.paccdesc`` (the substring ``.pac`` appears
+    # inside all of them), which is almost never what the user
+    # means when they type ``.pac damian`` or ``hel ext-style .pac``.
+    # The bare-token single-keystroke fast path in
+    # ``tab_explorer._refilter`` already handles this for the
+    # ``.pac`` (no space) case; this branch is the equivalent for
+    # multi-token queries that go through the complex evaluator.
+    if (len(tok) >= 2 and len(tok) <= 15
+            and tok.startswith(".") and tok.count(".") == 1
+            and "*" not in tok and "?" not in tok
+            and ":" not in tok):
+        return Clause("field", tok.lower(), field="ext", negated=negated)
+
     # Plain token — case-insensitive prefix match against tokens
     return Clause("token", tok.lower(), negated=negated)
 
@@ -369,9 +402,14 @@ def evaluate_clause(clause: Clause, *, name: str, path: str,
         return ok != clause.negated
 
     if kind == "wildcard":
-        target_path = path
-        target_name = name
-        ok = _fn.fnmatch(target_path, val) or _fn.fnmatch(target_name, val)
+        # Prefer the parse-time pre-compiled regex (see Clause.__init__).
+        # Falls back to fnmatch.fnmatch only if compilation failed —
+        # e.g. for malformed globs we still produce a defined result.
+        cre = getattr(clause, "compiled", None)
+        if cre is not None:
+            ok = cre.match(path) is not None or cre.match(name) is not None
+        else:
+            ok = _fn.fnmatch(path, val) or _fn.fnmatch(name, val)
         return ok != clause.negated
 
     if kind == "field":

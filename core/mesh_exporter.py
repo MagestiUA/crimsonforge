@@ -351,6 +351,7 @@ def _write_cfmeta_sidecar_v2(
     mesh: ParsedMesh,
     base_path: str,
     per_submesh_view: list[dict],
+    skeleton=None,
 ) -> str | None:
     """Write a schema-v2 sidecar that supports filtered (spike) vertices.
 
@@ -367,6 +368,18 @@ def _write_cfmeta_sidecar_v2(
         slots so the rebuilt PAC has identical vertex count + content
         to the source.
 
+    Also writes a top-level ``skeleton_bones: list[str]`` field when
+    a non-empty ``skeleton`` is supplied. The list is the bone-name
+    sequence in PAB index order (i.e. ``skeleton_bones[i]`` is the
+    name of the bone whose PAB index is ``i``). This is what the
+    FBX re-importer uses to map cluster bone-NAMES back to PAB
+    indices, which in turn is what
+    :func:`core.mesh_importer._build_pac_*` needs to write the
+    user's edited skin weights into the rebuilt PAC bytes. Without
+    it the rebuilder has no way to round-trip the names Blender
+    wrote into FBX cluster nodes back to the source skeleton —
+    strict refusal kicks in, no fallback.
+
     ``per_submesh_view`` items are dicts produced from
     ``_filtered_submesh_view``; one per submesh in mesh.submeshes
     order, each with keys ``new_to_old`` and ``dropped``.
@@ -375,6 +388,22 @@ def _write_cfmeta_sidecar_v2(
     rely on its presence to detect the v2 schema.
     """
     import json
+
+    # Per-submesh PAB-index → raw-slot map. Computed by reading the
+    # original PAC's vertex byte records and pairing the non-zero
+    # raw slots with the PAB indices the export-side derived. The
+    # rebuild path uses this map to write the user's edited skin
+    # weights back into the PAC vertex bytes — without it the
+    # mapping has no strict source of truth and skin write-back
+    # has to refuse, falling back to donor verbatim.
+    pac_bytes_for_inverse = getattr(mesh, "_pac_bytes", None)
+
+    # Lazy import — _build_pab_to_slot_for_submesh lives in the
+    # importer module to keep the byte-layout helpers in one place.
+    try:
+        from core.mesh_importer import _build_pab_to_slot_for_submesh
+    except Exception:
+        _build_pab_to_slot_for_submesh = None
 
     submeshes_json = []
     for sm, view in zip(mesh.submeshes, per_submesh_view):
@@ -397,15 +426,46 @@ def _write_cfmeta_sidecar_v2(
             sm_json["filtered_faces"] = [
                 [int(a), int(b), int(c)] for a, b, c in view["dropped_faces"]
             ]
+        # Compute pab_to_slot from the FULL pre-filter submesh — the
+        # PAC bytes don't know about the filter and the user's edited
+        # FBX vertices may map back to ANY original PAC vertex. Any
+        # PAB index used in the original PAC is a valid candidate.
+        if (pac_bytes_for_inverse is not None
+                and _build_pab_to_slot_for_submesh is not None
+                and getattr(sm, "bone_indices", None)
+                and getattr(sm, "source_vertex_offsets", None)):
+            inverse = _build_pab_to_slot_for_submesh(
+                sm, pac_bytes_for_inverse,
+            )
+            if inverse:
+                # JSON keys must be strings — convert int → str.
+                # The reader on the rebuild side converts back.
+                sm_json["pab_to_slot"] = {
+                    str(int(pab)): int(slot)
+                    for pab, slot in inverse.items()
+                }
         submeshes_json.append(sm_json)
 
-    payload = {
+    payload: dict = {
         "schema_version": 2,
         "tool": "CrimsonForge",
         "source_path": mesh.path,
         "source_format": mesh.format,
         "submeshes": submeshes_json,
     }
+
+    # Skeleton bone-name table. Indexed by PAB position so the
+    # round-trip importer can map FBX cluster names back to PAB
+    # indices deterministically. We store the FULL list (including
+    # placeholder/empty names if any) so the index space is
+    # 1:1-aligned with the source skeleton — no inference required
+    # at the consuming side.
+    if skeleton is not None:
+        bones = getattr(skeleton, "bones", None) or []
+        if bones:
+            payload["skeleton_bones"] = [
+                str(getattr(b, "name", "") or "") for b in bones
+            ]
 
     sidecar_path = base_path + ".cfmeta.json"
     try:
@@ -1021,8 +1081,34 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                               name: str = "", scale: float = 1.0,
                               filter_unskinned_outliers: bool = False,
                               animation=None,
-                              fps: float = 30.0) -> str:
-    """Export mesh + skeleton (+ optional animation) to FBX.
+                              fps: float = 30.0,
+                              *,
+                              textures=None,
+                              texture_vfs=None) -> str:
+    """Export mesh + skeleton (+ optional animation, + optional textures) to FBX.
+
+    When ``textures`` is a populated
+    :class:`core.pac_xml_texture_resolver.PacTextureManifest` AND
+    ``texture_vfs`` exposes :meth:`read_path_bytes`, the exporter:
+
+      1. Saves every unique DDS referenced by the manifest into a
+         ``<basename>_textures/`` sub-folder next to the FBX (verbatim
+         bytes — DDS isn't re-encoded).
+      2. Emits one ``Texture`` + one ``Video`` FBX node per unique
+         DDS, with ``RelativeFilename`` pointing into the
+         ``<basename>_textures/`` folder.
+      3. Adds ``OP`` connections from each texture to its submesh
+         Material's input — ``DiffuseColor`` for the base color,
+         ``NormalMap`` for the normal, ``SpecularColor`` for the
+         packed material/spec map, ``DisplacementColor`` for the
+         height map.
+      4. Strict 1+1: only slots that the resolver populated get
+         wired. Submesh records with no base color (procedural
+         shaders) get a Material node with no texture connections —
+         no inferred fallback to a neighbouring DDS.
+
+    Without ``textures``, the function behaves exactly as before
+    (no texture nodes, no DDS files saved, plain Material nodes).
 
     The skeleton parameter is a Skeleton object from skeleton_parser.
     Bone hierarchy is written as FBX LimbNode models connected to the
@@ -1254,6 +1340,146 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
     root_id = uid()
     pose_id = uid()
 
+    # ── TEXTURE POOL (only when `textures` manifest is provided) ──
+    # The resolver-supplied manifest carries one record per submesh,
+    # naming the canonical VFS path of every texture this Material
+    # references. We:
+    #   1. dedupe across submeshes (a single DDS shared by several
+    #      Materials gets one Texture+Video pair, not N)
+    #   2. read its bytes through the supplied texture_vfs view
+    #   3. write the verbatim DDS to <output_dir>/<base>_textures/
+    #   4. allocate one Texture id + one Video id per saved file
+    #   5. build a per-submesh role map so the connection writer
+    #      can wire OP <texture> -> <material>.<input> for each
+    #      role we know how to bind in Blender BSDF
+    #
+    # When the manifest is None, every related variable stays empty
+    # and the export falls back to the legacy "no texture" code path.
+    texture_pool: list[tuple[str, str, str, object, object]] = []
+    # ^ each entry: (vfs_path, abs_path_on_disk, rel_path, tex_id, vid_id)
+    texture_id_for_path: dict[str, tuple[object, object]] = {}
+    submesh_texture_roles: list[dict[str, object]] = []
+    # ^ per submesh index -> {fbx_property_name: tex_id}
+    texture_dir_rel = ""
+    texture_log_lines: list[str] = []
+
+    # Slot _name -> FBX Material property the OP connection targets.
+    # Verified against the Blender FBX importer:
+    #   - DiffuseColor       → Principled BSDF Base Color
+    #   - NormalMap          → Principled BSDF Normal (via Normal Map node)
+    #   - SpecularColor      → Principled BSDF Specular Tint
+    #   - DisplacementColor  → Material Output Displacement
+    _ROLE_FOR_BSDF = {
+        "base_color":   "DiffuseColor",
+        "normal_map":   "NormalMap",
+        "material_map": "SpecularColor",
+        "height_map":   "DisplacementColor",
+    }
+
+    if textures is not None and texture_vfs is not None \
+            and getattr(textures, "records", None):
+        tex_dir_abs = os.path.join(output_dir, f"{base}_textures")
+        os.makedirs(tex_dir_abs, exist_ok=True)
+        texture_dir_rel = f"{base}_textures"
+
+        # First pass: collect every distinct VFS path the resolver
+        # populated. Order is stable (dict preserves insertion).
+        ordered_paths: list[str] = []
+        seen: set[str] = set()
+        for rec in textures.records:
+            for path in (rec.base_color, rec.normal_map,
+                         rec.material_map, rec.height_map):
+                if path and path not in seen:
+                    seen.add(path)
+                    ordered_paths.append(path)
+            # extra_slots aren't BSDF-mapped but we still SAVE them
+            # so the Blender user can hand-wire the procedural shader
+            # if they need to. Not wired into Material connections.
+            for _slot, p in rec.extra_slots.items():
+                if p and p not in seen:
+                    seen.add(p)
+                    ordered_paths.append(p)
+
+        # Second pass: read each DDS via the supplied VFS view and
+        # save it. Only paths that produce real bytes get a Texture
+        # entry — paths that fail to read are recorded in the debug
+        # log so the user knows which slots were missing.
+        #
+        # Disambiguation: if two different VFS paths share a
+        # basename within THIS run we suffix the second one with a
+        # stable hash of the full VFS path. We track basenames
+        # written by THIS run in `basenames_this_run` rather than
+        # checking ``os.path.exists`` because a leftover file from a
+        # previous run is NOT a same-run collision — it should be
+        # overwritten with this run's bytes (same VFS path = same
+        # DDS content) instead of being preserved alongside a
+        # disambiguated copy.
+        basenames_this_run: set[str] = set()
+        for vfs_path in ordered_paths:
+            try:
+                data = texture_vfs.read_path_bytes(vfs_path)
+            except Exception as exc:
+                texture_log_lines.append(
+                    f"DDS read failed: {vfs_path} ({exc})"
+                )
+                continue
+            if not data:
+                texture_log_lines.append(
+                    f"DDS not in VFS: {vfs_path}"
+                )
+                continue
+            local_basename = os.path.basename(vfs_path)
+            if local_basename.lower() in basenames_this_run:
+                # Same basename from a different VFS path inside
+                # this same export — disambiguate so we don't lose
+                # one of the two distinct DDS files.
+                stem, ext = os.path.splitext(local_basename)
+                tag = format(hash(vfs_path) & 0xFFFF, "04x")
+                local_basename = f"{stem}_{tag}{ext}"
+            basenames_this_run.add(local_basename.lower())
+            local_path = os.path.join(tex_dir_abs, local_basename)
+            try:
+                with open(local_path, "wb") as f:
+                    f.write(data)
+            except Exception as exc:
+                texture_log_lines.append(
+                    f"DDS write failed: {local_path} ({exc})"
+                )
+                continue
+            tex_id = uid()
+            vid_id = uid()
+            rel_path = f"{texture_dir_rel}/{local_basename}"
+            texture_pool.append(
+                (vfs_path, local_path, rel_path, tex_id, vid_id)
+            )
+            texture_id_for_path[vfs_path] = (tex_id, vid_id)
+
+        texture_log_lines.append(
+            f"Texture pool: {len(texture_pool)} unique DDS file(s) "
+            f"saved to {texture_dir_rel}/"
+        )
+
+        # Third pass: build per-submesh role -> tex_id maps. For each
+        # submesh, we look up the resolver record by index and wire
+        # whichever BSDF roles got populated.
+        for rec in textures.records:
+            roles: dict[str, object] = {}
+            for bsdf_field, fbx_prop in _ROLE_FOR_BSDF.items():
+                p = getattr(rec, bsdf_field, None)
+                if p and p in texture_id_for_path:
+                    roles[fbx_prop] = texture_id_for_path[p][0]  # tex_id
+            submesh_texture_roles.append(roles)
+
+    # If no manifest was provided, give every submesh an empty role
+    # map so downstream connection-writer code is index-safe.
+    if not submesh_texture_roles:
+        submesh_texture_roles = [dict() for _ in mesh.submeshes]
+    elif len(submesh_texture_roles) < len(mesh.submeshes):
+        # Defensive: pad to match submesh count if the manifest had
+        # fewer records (rare; but keeps indexing safe).
+        while len(submesh_texture_roles) < len(mesh.submeshes):
+            submesh_texture_roles.append(dict())
+
     # ── ARMATURE NULL (only when `animation` is provided) ──
     # Blender's FBX importer needs an explicit "Null" Model node as the
     # common parent of all root bones to recognize the bone tree as
@@ -1293,6 +1519,7 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
         W(buf, "Documents", children=[documents])
 
         _bone_count_for_def = len(skeleton.bones)
+        _tex_count_for_def = len(texture_pool)
         def definitions(b):
             type_counts = [
                 ("Model", _bone_count_for_def + len(mesh.submeshes)),
@@ -1306,6 +1533,14 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                 ("AnimationLayer", 1),
                 ("AnimationCurveNode", _bone_count_for_def),
                 ("AnimationCurve", _bone_count_for_def * 3),
+                # Texture / Video pairs are added only when the
+                # resolver-supplied manifest produced any. Definitions
+                # ObjectType blocks with Count=0 are technically valid
+                # but Blender's importer warns; we just omit them.
+                *([("Texture", _tex_count_for_def)]
+                  if _tex_count_for_def else []),
+                *([("Video", _tex_count_for_def)]
+                  if _tex_count_for_def else []),
             ]
             W(b, "Version", [100])
             W(b, "Count", [len(type_counts)])
@@ -1664,6 +1899,61 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                 W(b2, "ShadingModel", ["phong"])
             W(b, "Material", [ma_id, f"{sm.material or sm.name}\x00\x01Material", ""],
               children=[mat_node])
+
+        # ── TEXTURE + VIDEO NODES (one pair per unique DDS) ──
+        # FBX 7.4 represents a bound texture as a Texture node that
+        # references a Video node holding the file path. Connections
+        # then route Video::Video → Texture::Texture (OO) and
+        # Texture::Texture → Material::<Property> (OP), e.g.
+        # Texture::Texture → Material::DiffuseColor.
+        #
+        # We emit one Texture+Video for every distinct DDS in the
+        # texture pool — sharing across submeshes is preserved by
+        # reusing the same tex_id in each Material's connection
+        # block. RelativeFilename is what Blender follows when
+        # importing; we keep it as <basename>_textures/foo.dds so
+        # the FBX + textures folder can be moved together as a unit.
+        for vfs_path, abs_path, rel_path, tex_id, vid_id in texture_pool:
+            tex_basename = os.path.basename(rel_path)
+
+            def video_node(b2, _abs=abs_path, _rel=rel_path,
+                           _name=tex_basename):
+                W(b2, "Type", ["Clip"])
+
+                def video_props(b3):
+                    # Path is what Blender's importer reads first.
+                    W(b3, "P", ["Path", "KString", "XRefUrl", "", _abs])
+                W(b2, "Properties70", children=[video_props])
+                W(b2, "UseMipMap", [0])
+                W(b2, "Filename", [_abs])
+                W(b2, "RelativeFilename", [_rel])
+            W(b, "Video", [vid_id, f"{tex_basename}\x00\x01Video", "Clip"],
+              children=[video_node])
+
+            def texture_node(b2, _abs=abs_path, _rel=rel_path,
+                             _name=tex_basename):
+                W(b2, "Type", ["TextureVideoClip"])
+                W(b2, "Version", [202])
+                W(b2, "TextureName",
+                  [f"{_name}\x00\x01Texture"])
+
+                def tex_props(b3):
+                    # CurrentTextureBlendMode = additive (1) is the
+                    # default Blender expects when importing a
+                    # diffuse map.
+                    W(b3, "P", ["UseMaterial", "bool", "", "", 1])
+                    W(b3, "P", ["UVSet", "KString", "", "", "UVMap"])
+                W(b2, "Properties70", children=[tex_props])
+                W(b2, "Media", [f"{_name}\x00\x01Video"])
+                W(b2, "FileName", [_abs])
+                W(b2, "RelativeFilename", [_rel])
+                W(b2, "ModelUVTranslation", [0.0, 0.0])
+                W(b2, "ModelUVScaling", [1.0, 1.0])
+                W(b2, "Texture_Alpha_Source", ["None"])
+                W(b2, "Cropping", [0, 0, 0, 0])
+            W(b, "Texture",
+              [tex_id, f"{tex_basename}\x00\x01Texture", ""],
+              children=[texture_node])
 
         # ── Precompute LOCAL bind matrix per bone ──
         #
@@ -2266,6 +2556,24 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
             W(b, "C", ["OO", mesh_ids[idx], model_ids[idx]])
             W(b, "C", ["OO", mat_ids[idx], model_ids[idx]])
 
+        # ── TEXTURE CONNECTIONS ──
+        # Wire each unique Video → its Texture, and each Texture →
+        # the Material property it binds (DiffuseColor / NormalMap /
+        # SpecularColor / DisplacementColor). The role map was
+        # built per-submesh from the resolver manifest above; only
+        # roles the resolver actually populated get a connection,
+        # so unbound slots stay unbound (no fallback wiring).
+        for vfs_path, _abs, _rel, tex_id, vid_id in texture_pool:
+            # Video::Video → Texture::Texture
+            W(b, "C", ["OO", vid_id, tex_id])
+        for idx in range(len(mesh.submeshes)):
+            roles = submesh_texture_roles[idx] if idx < len(
+                submesh_texture_roles) else {}
+            mat_target = mat_ids[idx]
+            for fbx_prop, tex_id in roles.items():
+                # Texture::Texture → Material::<property>
+                W(b, "C", ["OP", tex_id, mat_target, fbx_prop])
+
         # BindPose → root
         if skeleton and skeleton.bones and not skip_skin:
             W(b, "C", ["OO", pose_id, _FbxId(0)])
@@ -2403,7 +2711,9 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
     # without source_vertex_map it can't tell which PAC vertex slot a
     # given FBX vertex came from, and without filtered_vertices it has
     # no way to reinsert the dropped engine helper geometry.
-    sidecar_path = _write_cfmeta_sidecar_v2(mesh, fbx_path, submesh_views)
+    sidecar_path = _write_cfmeta_sidecar_v2(
+        mesh, fbx_path, submesh_views, skeleton=skeleton,
+    )
     if sidecar_path:
         logger.info("Sidecar written: %s", sidecar_path)
 

@@ -268,11 +268,20 @@ class VfsManagerAdapter:
     The adapter scans every loaded PAMT for ``.pab`` entries once
     and caches the result. A second call with a different VfsManager
     instance would need its own adapter (the cache is per-instance).
+
+    Also caches PARSED skeletons, keyed by VFS path. Without this
+    cache, ``resolve_skeleton`` with palette validation re-parses
+    every PAB candidate on every export call (50+ PABs in a typical
+    install, ~5-15 ms each). With the cache, the first export
+    populates it once, every subsequent export is essentially free.
     """
 
     def __init__(self, vfs):
         self._vfs = vfs
         self._pab_index: dict[str, object] | None = None   # path -> entry
+        # path -> parsed Skeleton object. Lazily populated by
+        # ``read_parsed_pab`` so we never parse the same PAB twice.
+        self._parsed_pab_cache: dict[str, object] = {}
 
     def _ensure_index(self) -> dict[str, object]:
         if self._pab_index is not None:
@@ -306,6 +315,34 @@ class VfsManagerAdapter:
             raise LookupError(f"PAB not found in VFS: {path}")
         return self._vfs.read_entry_data(entry)
 
+    def read_parsed_pab(self, path: str):
+        """Return a parsed ``Skeleton`` for the PAB at ``path``,
+        cached. Returns ``None`` on read or parse failure.
+
+        The cache is per-adapter, lifetime = adapter lifetime. This
+        is what makes ``resolve_skeleton`` with ``pac_bytes`` fast on
+        repeat calls — the first export pays for parsing every
+        candidate PAB once; subsequent exports through the same
+        adapter are O(N_candidates) bytes scans against pre-parsed
+        skeletons (no I/O, no re-parse).
+        """
+        key = path.replace("\\", "/")
+        cached = self._parsed_pab_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            raw = self.read_pab_bytes(path)
+        except Exception:
+            self._parsed_pab_cache[key] = None
+            return None
+        try:
+            parsed = _parse_pab(raw, path)
+        except Exception:
+            self._parsed_pab_cache[key] = None
+            return None
+        self._parsed_pab_cache[key] = parsed
+        return parsed
+
 
 # ── Resolution entry point ───────────────────────────────────────────
 
@@ -314,21 +351,22 @@ class SkeletonResolution:
     """Result of a full skeleton resolution attempt.
 
     ``skeleton`` is the parsed :class:`core.skeleton_parser.Skeleton`
-    when resolution succeeded, ``None`` otherwise. ``source`` is a
-    short string the UI uses to explain where the rig came from:
+    when resolution succeeded, ``None`` otherwise. ``source`` is one
+    of three strict, deterministic values:
 
-      * ``"prefix_match"``   — rig found via prefix auto-detect
-      * ``"manual"``         — user picked the .pab by hand
-      * ``"sibling_path"``   — rare non-character path: the PAC had a real sibling .pab
-      * ``"fallback_scan"``  — last-resort nearest-basename scan
+      * ``"manual"``         — caller named the .pab via override
+      * ``"palette_match"``  — winner picked by PAC section-0 hash
+                               overlap against PAB bone-hash tables
+      * ``"prefix_match"``   — winner picked by rig prefix encoded in
+                               the asset filename (no pac_bytes case)
 
-    ``reason`` carries a human-readable diagnostic when
-    ``skeleton is None``, e.g.
-    ``"no .pab matching prefix 'phm' found in VFS"``.
+    There is no ``sibling_path`` or ``fallback_scan`` — the resolver
+    refuses rather than guess. When it can't pick deterministically
+    ``skeleton`` is ``None`` and ``reason`` carries the diagnostic.
 
     ``pab_path`` is the VFS-relative path of the chosen rig, empty
-    when nothing was picked. Useful for logging and for the config
-    persistence (remembering per-prefix choices).
+    when nothing was picked. Useful for logging and for config
+    persistence (remembering per-prefix manual choices).
     """
     skeleton: object = None                # core.skeleton_parser.Skeleton
     pab_path: str = ""
@@ -349,32 +387,122 @@ def _parse_pab(raw: bytes, source_path: str):
     return parse_pab(raw, source_path)
 
 
+def _extract_pac_palette(
+    pac_bytes: bytes, valid_hash_universe: set,
+) -> list[int]:
+    """Locate the PAC's per-mesh skinning palette table.
+
+    Scans every 4-aligned u32 boundary for the longest contiguous
+    run of values whose low-24 bits are members of
+    ``valid_hash_universe`` (typically the union of every known
+    PAB's bone-hash table). The palette table is, by construction,
+    a contiguous array of bone-hash u32 entries — random PAC bytes
+    almost never form 5+ contiguous matches against the union set
+    (probability ≈ (~0.001)⁵ even at 16M bone-hash density), so
+    the longest run found IS the palette.
+
+    Returns the palette in slot-index order (low-24 bits only), or
+    an empty list if no qualifying run exists. The 5-entry minimum
+    is the same threshold ``core.mesh_parser._scan_pac_skin_palette``
+    uses for its skeleton-bound decode pass.
+    """
+    n = len(pac_bytes)
+    best_off = -1
+    best_len = 0
+    i = 0
+    while i + 4 <= n:
+        word = (pac_bytes[i]
+                | (pac_bytes[i + 1] << 8)
+                | (pac_bytes[i + 2] << 16))
+        if word in valid_hash_universe:
+            run_len = 0
+            j = i
+            while j + 4 <= n:
+                w2 = (pac_bytes[j]
+                      | (pac_bytes[j + 1] << 8)
+                      | (pac_bytes[j + 2] << 16))
+                if w2 in valid_hash_universe:
+                    run_len += 1
+                    j += 4
+                else:
+                    break
+            if run_len > best_len:
+                best_len = run_len
+                best_off = i
+            i = j
+        else:
+            i += 1
+    if best_len < 5 or best_off < 0:
+        return []
+    return [
+        pac_bytes[best_off + k * 4]
+        | (pac_bytes[best_off + k * 4 + 1] << 8)
+        | (pac_bytes[best_off + k * 4 + 2] << 16)
+        for k in range(best_len)
+    ]
+
+
 def resolve_skeleton(
     asset_path: str,
     vfs: SkeletonVfs,
     manual_override: Optional[str] = None,
+    pac_bytes: Optional[bytes] = None,
 ) -> SkeletonResolution:
-    """Best-effort resolve the rig for an asset path.
+    """Strictly deterministic skeleton resolution — never guesses.
 
-    Resolution order:
+    Four (and only four) explicit paths, each producing a
+    deterministic answer or a refusal — never a guess:
 
-      1. If ``manual_override`` is set and readable, use it.
-      2. Detect the rig prefix from the asset basename.
-      3. Ask the VFS for every ``.pab`` it knows.
-      4. Rank candidates via :func:`rank_skeleton_candidates`.
-      5. Take the top candidate, load + parse it.
+      1. **Manual override** — caller named the .pab. Use it.
 
-    Any step that fails produces a populated ``reason`` so the UI
-    can show it to the user and decide whether to fall back to a
-    mesh-only export or open a manual picker.
+      2. **Palette-table coverage** — caller provided ``pac_bytes``.
+         The PAC's actual per-mesh skinning palette table (a
+         contiguous array of u32 bone-hash entries inside section 0)
+         is located by the same longest-run scan
+         ``mesh_parser._scan_pac_skin_palette`` uses for skin
+         decoding. Each PAB is then scored by how many of its
+         bone hashes appear in that table. The PAB with maximum
+         coverage wins. **No PAB covers any palette entry → REFUSE**
+         (the PAC's palette uses hashes that aren't in any installed
+         PAB — likely a stale install or an unrecognised mod). **No
+         palette table found → REFUSE** (rigid prop; the caller must
+         resolve via the engine socket-attach mechanism).
 
-    Never raises — all exceptions are captured and surfaced through
-    ``reason``. This lets the caller treat the resolver as a
-    black box.
+         Why this beats whole-PAC byte-overlap scoring
+         ---------------------------------------------
+         A previous revision scored PABs against every 4-aligned
+         u24 in the PAC. That universe is dominated by vertex
+         positions, UVs, and packed normals — random byte noise. On
+         a small accessory or monster PAC the noise floor (~5–6%
+         per bone) put deep-bone-count alien rigs (golem 419 bones,
+         phm_01 434 bones) within a few hits of the correct rig,
+         and rank-order ties flipped the wrong winner.
+
+         The palette table itself is small (~30 entries for an
+         accessory, ~200 for a body), structurally distinct (every
+         entry MUST be a valid bone hash from some PAB), and a
+         correct rig covers ~100% of it while every other rig
+         covers ~0%. Scoring against the table — not the byte
+         soup — restores a clean signal-to-noise ratio.
+
+      3. **Prefix match** — no ``pac_bytes`` given. Detect the rig
+         prefix from the asset basename, filter VFS PABs to those
+         whose basename starts with ``<prefix>_``, and pick the
+         canonical (shortest) one. **No prefix detected → REFUSE**;
+         we have no deterministic signal to pick a rig. Multiple
+         prefix-PABs are tried in canonical order; first parseable
+         non-empty wins.
+
+      4. **Refuse** — no manual override, no ``pac_bytes``, no
+         prefix. There is no deterministic signal. Return
+         ``skeleton=None`` with an explicit ``reason``; the UI
+         surfaces it and the user picks via manual override.
+
+    Never raises — all exceptions are captured into ``reason``.
     """
     resolution = SkeletonResolution(rig_prefix=detect_rig_prefix(asset_path))
 
-    # 1) Manual override wins unconditionally.
+    # ── 1) Manual override (explicit, user-chosen) ───────────────────
     if manual_override:
         try:
             raw = vfs.read_pab_bytes(manual_override)
@@ -400,13 +528,12 @@ def resolve_skeleton(
         resolution.source = "manual"
         return resolution
 
-    # 2) Auto-resolve via prefix match.
+    # ── Enumerate the PAB universe ───────────────────────────────────
     try:
         all_pabs = vfs.list_pab_paths()
     except Exception as e:
         resolution.reason = f"VFS enumeration failed: {e}"
         return resolution
-
     if not all_pabs:
         resolution.reason = "no .pab files visible through the VFS"
         return resolution
@@ -415,35 +542,122 @@ def resolve_skeleton(
         resolution.rig_prefix, all_pabs, asset_path=asset_path,
     )
     resolution.candidates_tried = list(ordered)
+    get_parsed = getattr(vfs, "read_parsed_pab", None)
 
-    for candidate in ordered:
+    def _load_parsed(candidate: str):
+        """Return parsed Skeleton (or None) for a candidate PAB,
+        using the adapter cache when available so a multi-PAC export
+        pays the parse cost once across calls."""
+        if get_parsed is not None:
+            return get_parsed(candidate)
         try:
             raw = vfs.read_pab_bytes(candidate)
         except Exception:
-            continue
+            return None
         try:
-            parsed = _parse_pab(raw, candidate)
+            return _parse_pab(raw, candidate)
         except Exception:
-            continue
-        if not getattr(parsed, "bones", None):
+            return None
+
+    # ── 2) Palette-table coverage (deterministic from PAC bytes) ────
+    if pac_bytes is not None:
+        # Pre-parse every candidate once and stash for both the
+        # union build and the per-PAB coverage score below.
+        parsed_by_path: dict[str, object] = {}
+        all_hashes_union: set = set()
+        for candidate in ordered:
+            parsed = _load_parsed(candidate)
+            if parsed is None or not getattr(parsed, "bones", None):
+                continue
+            hashes = getattr(parsed, "bone_hashes", None) or []
+            if not hashes:
+                continue
+            parsed_by_path[candidate] = parsed
+            all_hashes_union.update(hashes)
+
+        if not all_hashes_union:
+            resolution.reason = (
+                "no parseable PAB with bone hashes found in VFS — "
+                "cannot decode PAC palette"
+            )
+            return resolution
+
+        palette = _extract_pac_palette(pac_bytes, all_hashes_union)
+        if not palette:
+            resolution.reason = (
+                "PAC contains no skin-palette table — likely a rigid "
+                "prop (must be attached via the engine socket table, "
+                "not skin-bound to a skeleton)"
+            )
+            return resolution
+        palette_set = set(palette)
+
+        # Score every parsed PAB by how many palette entries it
+        # covers. Iterate in rank order so that genuine ties (rare:
+        # only LOD/variant copies of the same rig) resolve to the
+        # canonical short-basename winner.
+        best_score = 0
+        best_candidate: Optional[str] = None
+        best_skeleton = None
+        for candidate in ordered:
+            parsed = parsed_by_path.get(candidate)
+            if parsed is None:
+                continue
+            hashes = getattr(parsed, "bone_hashes", None) or []
+            score = sum(1 for h in hashes if h in palette_set)
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+                best_skeleton = parsed
+
+        if best_candidate is None or best_score == 0:
+            resolution.reason = (
+                f"PAC palette has {len(palette)} entries but no PAB "
+                f"covers any of them — palette uses hashes from a "
+                f"rig that isn't loaded in the VFS"
+            )
+            return resolution
+
+        resolution.skeleton = best_skeleton
+        resolution.pab_path = best_candidate
+        resolution.source = "palette_match"
+        return resolution
+
+    # ── 3) Prefix match (deterministic from filename) ───────────────
+    # No pac_bytes was provided. The only deterministic signal left
+    # is the rig prefix encoded in the asset filename.
+    if not resolution.rig_prefix:
+        resolution.reason = (
+            f"could not detect rig prefix from {asset_path!r} and "
+            f"no pac_bytes were provided — no deterministic signal "
+            f"available, refusing to guess"
+        )
+        return resolution
+
+    target = resolution.rig_prefix.lower() + "_"
+    prefix_matches = [
+        p for p in ordered
+        if os.path.basename(p).lower().startswith(target)
+    ]
+    if not prefix_matches:
+        resolution.reason = (
+            f"no PAB starting with {resolution.rig_prefix!r}_ found "
+            f"in VFS ({len(all_pabs)} PAB(s) searched)"
+        )
+        return resolution
+
+    for candidate in prefix_matches:
+        parsed = _load_parsed(candidate)
+        if parsed is None or not getattr(parsed, "bones", None):
             continue
         resolution.skeleton = parsed
         resolution.pab_path = candidate
-        base = os.path.basename(candidate).lower()
-        if (
-            resolution.rig_prefix
-            and base.startswith(resolution.rig_prefix + "_")
-        ):
-            resolution.source = "prefix_match"
-        elif asset_path and _same_directory(asset_path, candidate):
-            resolution.source = "sibling_path"
-        else:
-            resolution.source = "fallback_scan"
+        resolution.source = "prefix_match"
         return resolution
 
     resolution.reason = (
-        f"no usable .pab found (prefix={resolution.rig_prefix!r}, "
-        f"{len(all_pabs)} PAB(s) searched)"
+        f"all {len(prefix_matches)} PAB(s) with prefix "
+        f"{resolution.rig_prefix!r}_ failed to parse or had zero bones"
     )
     return resolution
 

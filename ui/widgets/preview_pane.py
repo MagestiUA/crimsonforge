@@ -67,10 +67,31 @@ def _prepare_mesh_data_async(
         )
         ext = os.path.splitext(path.lower())[1]
         full_mesh = None
+        vfs = pane_state.get("_active_vfs")
+        vfs_path = pane_state.get("_active_vfs_path")
+
         if ext == ".pac":
             preview_mesh = _build_pac_preview_mesh(
                 data, os.path.basename(path),
             )
+            # ── Texture path needs the full submesh tree ──
+            # ``_build_pac_preview_mesh`` produces a fast flat triangle
+            # soup for the GL viewer but no per-submesh material
+            # binding. The texture resolver needs the real submesh
+            # records (each submesh has its own pac_xml material entry
+            # that maps to a DDS path), so when the pane was opened
+            # with a VFS context we ALSO run the full ``parse_mesh``
+            # pass to populate ``full_mesh``. Without this the texture
+            # pipeline below silently no-ops on every PAC and the user
+            # sees an untextured mesh — exactly the "no texture, only
+            # Loading mesh…" report.
+            if vfs is not None and vfs_path:
+                try:
+                    full_mesh = parse_mesh(data, os.path.basename(path))
+                except Exception:
+                    # Non-fatal — preview still renders monochrome
+                    # without textures if the full parse blows up.
+                    full_mesh = None
         else:
             full_mesh = parse_mesh(data, os.path.basename(path))
             preview_mesh = _flatten_parsed_mesh_for_preview(full_mesh)
@@ -85,8 +106,6 @@ def _prepare_mesh_data_async(
         # the second click — see core.mesh_texture_service).
         face_colors: list = []
         texture_payload = None
-        vfs = pane_state.get("_active_vfs")
-        vfs_path = pane_state.get("_active_vfs_path")
         if vfs is not None and vfs_path and full_mesh is not None:
             try:
                 from core.mesh_texture_service import (
@@ -743,9 +762,18 @@ class PreviewPane(QWidget):
                 preview_mesh.normals,
                 **viewer_kwargs,
             )
-            self._info_label.setText(
-                self._info_label.text() + f"  |  {info_text}",
-            )
+            # Replace any in-flight "Loading mesh…" placeholder with
+            # the final status. Previously we appended, so a successful
+            # render left both strings in the label (e.g. "foo.pac |
+            # Loading mesh… | 7,636 verts | 9,940 faces"), which made
+            # users think the mesh was still loading after it had
+            # already rendered. Strict 1+1: the label always reflects
+            # the current state, never history.
+            file_label = os.path.basename(prepared.get("path") or "")
+            if file_label:
+                self._info_label.setText(f"{file_label}  |  {info_text}")
+            else:
+                self._info_label.setText(info_text)
             self._stack.setCurrentIndex(IDX_MESH)
             return
 

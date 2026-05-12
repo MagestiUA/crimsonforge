@@ -229,8 +229,12 @@ def parse_pab(data: bytes, filename: str = "") -> Skeleton:
         )
 
     skeleton.bone_count = len(skeleton.bones)
-    logger.info("Parsed PAB %s: %d bones",
-                filename, len(skeleton.bones))
+    # Demoted from INFO -> DEBUG. The skeleton resolver iterates every
+    # PAB candidate (50+ in a typical install) when palette validation
+    # is enabled (Fix C); an INFO line per parse floods the log with
+    # noise that's only useful when debugging the parser itself.
+    logger.debug("Parsed PAB %s: %d bones",
+                 filename, len(skeleton.bones))
     return skeleton
 
 

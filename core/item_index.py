@@ -53,9 +53,20 @@ def _find_entry(vfs: VfsManager, group: str, needle: str):
 
 
 def parse_localization(vfs: VfsManager, progress_fn=None) -> dict[str, str]:
-    """Parse English localization strings into ``loc_id -> text``."""
+    """Parse the active localization strings into ``loc_id -> text``.
+
+    Reads ``localizationstring_eng.paloc`` — the active-language slot
+    Crimson Desert populates from Steam's selected language. The
+    *filename* is always ``_eng`` regardless of the chosen language;
+    the *content* is whatever the user sees in-game (English,
+    Korean, Arabic, …). Strict 1+1: we accept that content verbatim
+    so the search index matches exactly the names the user reads on
+    screen. There is no language fallback, no transliteration, no
+    silent locale switching — the in-game text IS the source of
+    truth.
+    """
     if progress_fn:
-        progress_fn("Loading English localization...")
+        progress_fn("Loading active localization...")
 
     loc_entry = _find_entry(vfs, "0020", "localizationstring_eng")
     if not loc_entry:

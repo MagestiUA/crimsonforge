@@ -422,6 +422,10 @@ def import_obj(obj_path: str) -> ParsedMesh:
         total_faces=sum(len(s.faces) for s in submeshes),
         has_uvs=any(s.uvs for s in submeshes),
     )
+    # Stash the sidecar so the PAC rebuilder can read its
+    # ``pab_to_slot`` per-submesh map for strict skin write-back.
+    if sidecar is not None:
+        result._cfmeta_sidecar = sidecar
 
     if result.submeshes:
         all_v = [v for s in submeshes for v in s.vertices]
@@ -714,33 +718,91 @@ def import_fbx(fbx_path: str) -> ParsedMesh:
     for cid, sid in cluster_to_skin.items():
         skin_to_clusters.setdefault(sid, []).append(cid)
 
-    # Bone names are stable across Blender re-exports; assign a consecutive
-    # index to each unique bone name so split-vertex inheritance works.
+    # Resolve cluster bone NAMES to PAB indices via the sidecar's
+    # skeleton_bones table when present. The sidecar stores the
+    # PAB-index-ordered bone-name list at export time, so a
+    # cluster whose target Model is named "Bip01 Pelvis" maps
+    # deterministically to PAB index N where
+    # ``sidecar.skeleton_bones[N] == "Bip01 Pelvis"``.
+    #
+    # When the sidecar is absent or carries no skeleton_bones list
+    # (older exports), we fall through to the legacy synthetic-index
+    # assignment, but the rebuild path (_build_pac_*) will then
+    # refuse to write skin into the PAC because there is no strict
+    # name-to-PAB mapping available — exactly the no-fallback rule.
+    sidecar_skeleton_bones: list[str] = []
+    if isinstance(sidecar, dict):
+        sb = sidecar.get("skeleton_bones") or []
+        if isinstance(sb, list):
+            sidecar_skeleton_bones = [str(x) for x in sb]
+    name_to_pab: dict[str, int] = {
+        nm: i for i, nm in enumerate(sidecar_skeleton_bones) if nm
+    }
+
     bone_name_to_idx: dict[str, int] = {}
 
-    def _geo_skin_weights(geo_id: int) -> dict[int, list[tuple[int, float]]]:
-        """Return vi → [(bone_idx, weight)] for the skin bound to geo_id."""
+    def _bone_idx_for_name(bone_name: str) -> int:
+        """Resolve an FBX cluster's bone Model name to a stable
+        per-mesh integer index. When the sidecar carries
+        ``skeleton_bones`` we use the PAB index from that list
+        (so SubMesh.bone_indices ends up in PAB-index space —
+        the exact form the rebuilder needs to write skin back).
+        Otherwise we fall back to a per-import synthetic index
+        keyed on first-seen order; the rebuilder treats those
+        as untrusted and refuses to write skin from them.
+        """
+        pab_idx = name_to_pab.get(bone_name)
+        if pab_idx is not None:
+            return pab_idx
+        # No mapping — synthetic per-import index. We still need
+        # SOMETHING for SubMesh.bone_indices to keep the import
+        # path useful for callers that don't go through
+        # _build_pac_* (e.g. third-party diff tooling).
+        if bone_name not in bone_name_to_idx:
+            bone_name_to_idx[bone_name] = len(bone_name_to_idx)
+        return bone_name_to_idx[bone_name]
+
+    def _geo_skin_weights(
+        geo_id: int,
+    ) -> tuple[dict[int, list[tuple[int, float]]],
+                dict[int, list[tuple[str, float]]]]:
+        """Return ``(by_idx, by_name)`` for the skin bound to ``geo_id``.
+
+        ``by_idx`` maps ``vertex_index → [(int_idx, weight)]`` where
+        ``int_idx`` is the PAB index when the sidecar carries
+        ``skeleton_bones``, else a synthetic per-import id.
+
+        ``by_name`` maps ``vertex_index → [(bone_name, weight)]`` for
+        every cluster contribution. The rebuilder uses this verbatim
+        when it needs to map names directly to slots without trusting
+        the synthetic-index path.
+        """
         sid = geo_to_skin.get(geo_id)
         if sid is None:
-            return {}
-        out: dict[int, list[tuple[int, float]]] = {}
+            return {}, {}
+        by_idx: dict[int, list[tuple[int, float]]] = {}
+        by_name: dict[int, list[tuple[str, float]]] = {}
         for cid in skin_to_clusters.get(sid, []):
             cn = cluster_nodes.get(cid)
             if cn is None:
                 continue
             bone_mid = cluster_to_bone.get(cid)
-            bone_name = model_names.get(bone_mid, f'_bone_{cid}') if bone_mid else f'_bone_{cid}'
-            if bone_name not in bone_name_to_idx:
-                bone_name_to_idx[bone_name] = len(bone_name_to_idx)
-            bidx = bone_name_to_idx[bone_name]
+            bone_name = (
+                model_names.get(bone_mid, f'_bone_{cid}')
+                if bone_mid else f'_bone_{cid}'
+            )
+            bidx = _bone_idx_for_name(bone_name)
             idx_n = _fbx_find(cn['children'], 'Indexes')
             wt_n = _fbx_find(cn['children'], 'Weights')
             if not (idx_n and wt_n and idx_n['props'] and wt_n['props']):
                 continue
             for vi, w in zip(idx_n['props'][0], wt_n['props'][0]):
                 if isinstance(vi, int) and w > 0.0:
-                    out.setdefault(int(vi), []).append((bidx, float(w)))
-        return out
+                    by_idx.setdefault(int(vi), []).append((bidx, float(w)))
+                    by_name.setdefault(int(vi), []).append(
+                        (bone_name, float(w)),
+                    )
+        return by_idx, by_name
 
     # source_path comes from the optional sidecar (FBX itself doesn't carry
     # the game PAC path; build_pac only uses it for logging).
@@ -888,15 +950,26 @@ def import_fbx(fbx_path: str) -> ParsedMesh:
             return _conv_vec(n)
 
         # Bone weights from FBX Cluster nodes.
-        skin_weights = _geo_skin_weights(geo_id)   # vi → [(bidx, w)]
+        skin_weights, skin_names = _geo_skin_weights(geo_id)
         has_skin = bool(skin_weights)
         n_orig = len(base_verts)
         sb_indices: list[tuple[int, ...]] = []
         sb_weights: list[tuple[float, ...]] = []
+        sb_names: list[tuple[str, ...]] = []
         for i in range(n_orig):
-            pairs = sorted(skin_weights.get(i, []), key=lambda x: -x[1])
-            sb_indices.append(tuple(b for b, _ in pairs))
-            sb_weights.append(tuple(w for _, w in pairs))
+            # Sort by weight descending so the dominant bone leads.
+            # We sort by IDX-keyed pairs (definitive for sb_indices /
+            # sb_weights) and apply the same permutation to names so
+            # all three lists stay aligned.
+            idx_pairs = sorted(
+                skin_weights.get(i, []), key=lambda x: -x[1],
+            )
+            name_pairs = sorted(
+                skin_names.get(i, []), key=lambda x: -x[1],
+            )
+            sb_indices.append(tuple(b for b, _ in idx_pairs))
+            sb_weights.append(tuple(w for _, w in idx_pairs))
+            sb_names.append(tuple(n for n, _ in name_pairs))
 
         # Expand vertices: UV-seam splitting (same logic as import_obj)
         local_verts: list[tuple[float, float, float]] = list(base_verts)
@@ -906,6 +979,7 @@ def import_fbx(fbx_path: str) -> ParsedMesh:
         src_map: list[int] = list(range(len(base_verts)))
         bone_indices_out: list[tuple[int, ...]] = list(sb_indices)
         bone_weights_out: list[tuple[float, ...]] = list(sb_weights)
+        bone_names_out: list[tuple[str, ...]] = list(sb_names)
         corner_cache: dict[tuple, int] = {}
 
         def _resolve(vi: int, uv: tuple, norm: tuple) -> int:
@@ -929,6 +1003,9 @@ def import_fbx(fbx_path: str) -> ParsedMesh:
             src_map.append(src_map[vi] if vi < len(src_map) else vi)
             bone_indices_out.append(bone_indices_out[vi] if vi < len(bone_indices_out) else ())
             bone_weights_out.append(bone_weights_out[vi] if vi < len(bone_weights_out) else ())
+            bone_names_out.append(
+                bone_names_out[vi] if vi < len(bone_names_out) else ()
+            )
             corner_cache[key] = clone
             return clone
 
@@ -1014,6 +1091,11 @@ def import_fbx(fbx_path: str) -> ParsedMesh:
                     bw = entry.get("bone_weights") or []
                     bone_indices_out.append(tuple(int(b) for b in bi))
                     bone_weights_out.append(tuple(float(w) for w in bw))
+                    # Filtered verts come from the sidecar where we
+                    # don't store names — leave names empty. The
+                    # rebuild path treats empty names as "no name
+                    # info, fall back to int indices for this vert."
+                    bone_names_out.append(())
                     src_map.append(int(src_idx))
                     orig_to_new[int(src_idx)] = new_idx
                     appended += 1
@@ -1048,6 +1130,7 @@ def import_fbx(fbx_path: str) -> ParsedMesh:
             faces=local_faces,
             bone_indices=bone_indices_out if has_skin else [],
             bone_weights=bone_weights_out if has_skin else [],
+            bone_names=bone_names_out if has_skin else [],
             vertex_count=len(local_verts),
             face_count=len(local_faces),
             source_vertex_map=src_map,
@@ -1063,6 +1146,13 @@ def import_fbx(fbx_path: str) -> ParsedMesh:
         has_uvs=any(s.uvs for s in submeshes),
         has_bones=any(s.bone_indices for s in submeshes),
     )
+    # Stash the full sidecar dict on the imported mesh. The PAC
+    # rebuilder reads ``pab_to_slot`` from each submesh entry to
+    # write the user's edited skin weights back into the PAC vertex
+    # byte slots — without this the rebuilder has no strict mapping
+    # and refuses to overwrite donor skin bytes.
+    if sidecar is not None:
+        result._cfmeta_sidecar = sidecar
 
     if submeshes:
         all_v = [v for s in submeshes for v in s.vertices]
@@ -1074,6 +1164,41 @@ def import_fbx(fbx_path: str) -> ParsedMesh:
     logger.info("Imported FBX %s: %d submeshes, %d verts, %d faces, source=%s (%s)",
                 fbx_path, len(submeshes), result.total_vertices,
                 result.total_faces, source_path, source_format)
+
+    # ── Skin-weight normalisation diagnostic ──
+    # Pearl Abyss's PAC vertex shader expects per-vertex bone weights
+    # to sum to 1.0 (255 in u8). When the user paints in Blender with
+    # 'Auto Normalize Weights' OFF, multiple vertex groups can hold
+    # arbitrary values (e.g. three groups all at 1.0 → sum 3.0).
+    # Forge then renormalises during build_pac so the engine math
+    # works, but the round-trip back to FBX shows weight 0.333 per
+    # bone instead of the painted 1.0 — the source of just4u's
+    # "weight 1.000 -> 0.337" report.
+    #
+    # Surface this loudly the moment we see un-normalised input so
+    # the user knows what's about to happen and can toggle Auto
+    # Normalize before re-painting.
+    n_unnorm = 0
+    n_total = 0
+    for sm in submeshes:
+        for weights in sm.bone_weights:
+            wsum = sum(float(w) for w in weights if w > 0.0)
+            if wsum > 0.0:
+                n_total += 1
+                if abs(wsum - 1.0) > 0.01:
+                    n_unnorm += 1
+    if n_total and n_unnorm > 0:
+        pct = 100.0 * n_unnorm / n_total
+        logger.warning(
+            "FBX %s: %d / %d skinned vertices (%.1f%%) carry "
+            "un-normalised weights (Σ != 1.0). Forge will normalise "
+            "to engine convention on rebuild — this is what makes "
+            "painted weights round-trip as fractions (e.g. three "
+            "groups at 1.0 each → 0.333 per group). To preserve the "
+            "painted value, enable Blender's 'Weight Paint > Tool > "
+            "Options > Auto Normalize' BEFORE painting.",
+            fbx_path, n_unnorm, n_total, pct,
+        )
     return result
 
 
@@ -2814,6 +2939,229 @@ def _merge_partial_pac_import(
     return merged
 
 
+def _decode_donor_skin(rec: bytes) -> tuple[list[int], list[int]]:
+    """Decode a donor PAC vertex record into 8 raw bone slots + 8 raw u8 weights.
+
+    Layout (verified from shader DXIL — see
+    ``test_only/research/PAC_VERTEX_RECORD_DECODED.md``):
+
+        bytes 12-13 : bone slot 6 as f16 (decoded ``int(f16 + 0.5)``)
+        bytes 14-15 : bone slot 7 as f16
+        bytes 20-23 : u32 packing slots 0/1/2 as 3 × 10-bit
+        bytes 24-27 : u32 packing slots 3/4/5 as 3 × 10-bit
+        bytes 28-35 : 8 × u8 weights (each / 255 → unit weight)
+
+    The returned slots are RAW 10-bit values (0..1023). The returned
+    weights are RAW u8 values (0..255). Both arrays always have
+    length 8 even for vertices using fewer than 8 bones — the
+    rebuilder masks out zero-weight slots itself.
+
+    Raises ``ValueError`` if the record is shorter than 36 bytes
+    (which means the source PAC isn't using the verified 8-bone
+    skinning layout — strict refusal so caller knows nothing is
+    salvageable here).
+    """
+    if len(rec) < 36:
+        raise ValueError(
+            f"PAC vertex record too short for skin decode "
+            f"({len(rec)} bytes, need >= 36)"
+        )
+    b20_lo, b20_hi = struct.unpack_from("<II", rec, 20)
+    slot6_h, slot7_h = struct.unpack_from("<ee", rec, 12)
+    slots = [
+         b20_lo        & 0x3FF,
+        (b20_lo >> 10) & 0x3FF,
+        (b20_lo >> 20) & 0x3FF,
+         b20_hi        & 0x3FF,
+        (b20_hi >> 10) & 0x3FF,
+        (b20_hi >> 20) & 0x3FF,
+        int(slot6_h + 0.5) if not math.isnan(slot6_h) else 0,
+        int(slot7_h + 0.5) if not math.isnan(slot7_h) else 0,
+    ]
+    raw_weights = list(struct.unpack_from("<BBBBBBBB", rec, 28))
+    return slots, raw_weights
+
+
+def _pack_pac_skin_into_record(
+    rec: bytearray,
+    slots: list[int],
+    weights_u8: list[int],
+) -> None:
+    """Write 8 bone slots + 8 u8 weights into ``rec`` at the verified
+    PAC vertex-record offsets.
+
+    ``slots`` and ``weights_u8`` MUST each be length 8. Slots beyond
+    the 10-bit range raise ``ValueError`` (slots are physical bone
+    palette indices and the engine reads them as 10-bit; passing
+    1024+ would silently lose the high bits, which we refuse to do).
+    Weights outside 0..255 are clamped — but only after a debug
+    log because that case shouldn't happen if the caller normalised
+    correctly.
+
+    The byte writes mirror exactly the read layout in
+    :func:`_decode_donor_skin`. Bytes 12-15 (slot 6/7 as f16),
+    bytes 20-27 (slots 0-5 packed), bytes 28-35 (8 × weight u8).
+    Other bytes in ``rec`` are left untouched — the caller has
+    already overwritten position/UV/normal/tangent.
+    """
+    if len(slots) != 8 or len(weights_u8) != 8:
+        raise ValueError(
+            f"_pack_pac_skin_into_record needs exactly 8 slots + "
+            f"8 weights, got {len(slots)} / {len(weights_u8)}"
+        )
+    if len(rec) < 36:
+        raise ValueError(
+            f"PAC vertex record too short for skin write "
+            f"({len(rec)} bytes, need >= 36)"
+        )
+
+    # Slots 0-5: packed 3 × 10-bit per u32 at bytes 20-27.
+    for i, s in enumerate(slots):
+        if not (0 <= s <= 0x3FF):
+            raise ValueError(
+                f"bone slot {i} = {s} is outside the 10-bit range "
+                "the engine reads (0..1023)"
+            )
+    b20_lo = (
+        (slots[0] & 0x3FF)
+        | ((slots[1] & 0x3FF) << 10)
+        | ((slots[2] & 0x3FF) << 20)
+    )
+    b20_hi = (
+        (slots[3] & 0x3FF)
+        | ((slots[4] & 0x3FF) << 10)
+        | ((slots[5] & 0x3FF) << 20)
+    )
+    struct.pack_into("<II", rec, 20, b20_lo, b20_hi)
+
+    # Slots 6-7: f16 such that ``int(f16 + 0.5)`` recovers the slot.
+    # ``float(int_value)`` is exactly representable in f16 for
+    # 0..1023 (f16 has 11-bit mantissa), so the round-trip is exact.
+    struct.pack_into(
+        "<ee", rec, 12, float(slots[6]), float(slots[7]),
+    )
+
+    # 8 weights at bytes 28-35.
+    clamped = bytes(max(0, min(255, int(w))) for w in weights_u8)
+    rec[28:36] = clamped
+
+
+def _quantize_weights_to_u8(weights: list[float]) -> list[int]:
+    """Quantize a list of float weights (each in [0, 1]) into 8 u8
+    values that sum to 255 (the engine's normalisation invariant).
+
+    Strict procedure:
+      1. Pad / truncate to length 8.
+      2. Sum-normalise to 1.0 (refuse if input sum <= 0).
+      3. Multiply by 255 and round to nearest int.
+      4. Distribute residual ±1 to the largest-weight slot so the
+         u8 sum equals exactly 255 even after rounding (engine's
+         streamout shader divides each by 255 — sums that differ
+         from 1.0 cause subtle bone-influence drift).
+    """
+    if len(weights) > 8:
+        weights = weights[:8]
+    while len(weights) < 8:
+        weights.append(0.0)
+
+    total = sum(max(0.0, w) for w in weights)
+    if total <= 0.0:
+        # No weights at all — caller should have skipped this vertex.
+        # Returning all-zeros lets the rec end up with bone byte 0
+        # weighted at 0/255 = 0 (vertex contributes nothing through
+        # this slot), which is the valid "unweighted" pattern the
+        # engine accepts.
+        return [0] * 8
+    norm = [max(0.0, w) / total for w in weights]
+    quant = [int(round(w * 255.0)) for w in norm]
+    quant = [max(0, min(255, q)) for q in quant]
+    diff = 255 - sum(quant)
+    if diff != 0:
+        # Walk slots in weight-descending order and adjust until
+        # the sum matches. Strict 1+1: each ±1 adjustment touches
+        # the largest-weight slot first so the perceptible weight
+        # ratio matches the input as closely as possible.
+        order = sorted(range(8), key=lambda i: -norm[i])
+        idx = 0
+        step = 1 if diff > 0 else -1
+        while diff != 0:
+            slot = order[idx % 8]
+            new_val = quant[slot] + step
+            if 0 <= new_val <= 255:
+                quant[slot] = new_val
+                diff -= step
+            idx += 1
+            if idx > 64:
+                # Defensive: we've cycled 8x and still can't
+                # balance — caller's weights were degenerate.
+                break
+    return quant
+
+
+def _build_pab_to_slot_for_submesh(
+    sm,
+    pac_bytes: bytes,
+) -> dict[int, int]:
+    """Compute the per-submesh PAB-index → raw-slot inverse map.
+
+    This is the strict join between the FBX-side (which uses PAB
+    indices, named via ``skeleton.bones[i].name``) and the PAC-side
+    (which writes raw 10-bit slots into the vertex bytes). For each
+    vertex of ``sm`` we:
+
+      1. Decode the donor PAC record's 8 raw slots + 8 raw u8
+         weights via :func:`_decode_donor_skin`.
+      2. Filter to the non-zero-weight (slot, weight) pairs — the
+         parser drops zero-weight bones, so this matches the
+         length of ``sm.bone_indices[vi]`` exactly.
+      3. Pair each non-zero (slot, weight) with the corresponding
+         PAB index from ``sm.bone_indices[vi]`` (must be in PAB
+         space — caller is responsible for running
+         :func:`derive_skin_slot_to_pab_geometric` first).
+      4. Record the mapping with first-seen-wins semantics so the
+         result is deterministic across vertex order.
+
+    Returns ``{pab_index: raw_slot}``. PAB indices NOT seen in any
+    donor record are absent from the map; the rebuilder treats
+    that as strict refusal — there is no slot to write for those
+    PABs without inventing one (which would corrupt the engine's
+    skinning indirection).
+
+    ``sm.bone_indices`` MUST be populated and ``sm.source_vertex_offsets``
+    MUST point at valid donor records inside ``pac_bytes``. Any
+    vertex whose offset is out of range or whose record is too
+    short to decode skin from is silently skipped — those vertices
+    don't contribute to the inverse, but other vertices in the
+    same submesh still do.
+    """
+    inverse: dict[int, int] = {}
+    stride = getattr(sm, "source_vertex_stride", 0) or 0
+    if stride < 36:
+        # Submesh's PAC records are too short to carry the verified
+        # 8-bone skinning layout. Caller treats empty inverse as
+        # "no skin write-back possible for this submesh".
+        return inverse
+    offsets = getattr(sm, "source_vertex_offsets", []) or []
+    bone_indices = getattr(sm, "bone_indices", []) or []
+    for vi, rec_off in enumerate(offsets):
+        if vi >= len(bone_indices):
+            break
+        if rec_off < 0 or rec_off + stride > len(pac_bytes):
+            continue
+        rec = pac_bytes[rec_off:rec_off + stride]
+        try:
+            slots, weights = _decode_donor_skin(rec)
+        except ValueError:
+            continue
+        non_zero = [
+            (s, w) for s, w in zip(slots, weights) if w > 0
+        ]
+        pab_indices = bone_indices[vi]
+        for (slot, _w), pab_idx in zip(non_zero, pab_indices):
+            inverse.setdefault(int(pab_idx), int(slot))
+    return inverse
+
+
 def _pack_pac_normal(normal: tuple[float, float, float], existing_packed: int = 0) -> int:
     """Pack a float normal into the PAC vertex-record's u32 at byte +16.
 
@@ -3294,6 +3642,239 @@ def _pac_needs_full_rebuild(original_mesh: ParsedMesh, working_mesh: ParsedMesh)
     return False
 
 
+def _resolve_skin_write_context(
+    working_mesh: ParsedMesh,
+    sm_idx: int,
+    sm_name: str,
+):
+    """Pull the per-submesh ``pab_to_slot`` map from the imported
+    mesh's stashed sidecar.
+
+    Returns ``(pab_to_slot, donor_stride_known)``:
+      * ``pab_to_slot`` — ``dict[int, int]`` populated when the
+        sidecar carries the export-time mapping for this submesh,
+        empty otherwise (which means strict refusal — the rebuilder
+        will leave donor skin bytes alone for any vertex whose new
+        bone data we can't cross-reference).
+      * ``donor_stride_known`` — True when the sidecar was produced
+        by an export that knows the 8-bone vertex layout. Older
+        exports without this map produce ``False`` and skin
+        write-back is skipped strictly (donor preserved verbatim).
+
+    Strict 1+1: this function NEVER falls back to nearest-position
+    or palette guessing. It only returns what the export side
+    explicitly recorded.
+    """
+    sidecar = getattr(working_mesh, "_cfmeta_sidecar", None)
+    if not isinstance(sidecar, dict):
+        return {}, False
+    submeshes = sidecar.get("submeshes") or []
+    # Match by index first (the canonical export order), but also by
+    # name as a defensive cross-check so inadvertent reordering at
+    # import time doesn't silently mis-assign the map.
+    candidate = None
+    if 0 <= sm_idx < len(submeshes):
+        c = submeshes[sm_idx]
+        if isinstance(c, dict):
+            candidate = c
+    if candidate is None or candidate.get("name") != sm_name:
+        for c in submeshes:
+            if isinstance(c, dict) and c.get("name") == sm_name:
+                candidate = c
+                break
+    if candidate is None:
+        return {}, False
+    raw = candidate.get("pab_to_slot")
+    if not isinstance(raw, dict):
+        return {}, False
+    pab_to_slot: dict[int, int] = {}
+    try:
+        for k, v in raw.items():
+            pab_to_slot[int(k)] = int(v)
+    except (TypeError, ValueError):
+        return {}, False
+    return pab_to_slot, True
+
+
+def _check_strict_skin_writeback(
+    skin_pab_to_slot: dict[int, int],
+    orig_stride: int,
+    new_has_skin: bool,
+    sm_idx: int,
+    sm_name: str,
+) -> bool:
+    """Decide whether the rebuilder should write skin or refuse.
+
+    Strict 1+1 contract:
+
+      * Sidecar HAS ``pab_to_slot`` AND donor stride ≥ 36 AND new
+        submesh HAS bone_indices → write skin (returns True).
+      * Sidecar HAS ``pab_to_slot`` AND donor stride ≥ 36 AND new
+        submesh has NO bone_indices → REFUSE with ``ValueError``.
+        This is the case where the user imported a Forge-exported
+        FBX (sidecar v2 means we wrote it) but stripped vertex
+        groups from the submesh. We CANNOT silently preserve donor
+        weights — that hides the deletion. The user is told to
+        either re-paint or remove the submesh.
+      * Sidecar has NO ``pab_to_slot`` (OBJ import, third-party
+        FBX, missing sidecar) → preserve donor (returns False).
+        Topology-only contract; no strict source of truth for skin.
+      * Donor stride < 36 (rigid prop) → no skin to write
+        (returns False).
+
+    Centralising the decision here means both rebuild branches
+    (in-place and full-rebuild) take the exact same strict path,
+    and the refusal is locked in by unit tests.
+    """
+    have_target = bool(skin_pab_to_slot) and orig_stride >= 36
+    if have_target and not new_has_skin:
+        raise ValueError(
+            f"PAC build failed: submesh '{sm_name}' (#{sm_idx}) "
+            f"in the imported FBX has no vertex groups, but the "
+            f"original PAC submesh is skin-bound (stride "
+            f"{orig_stride} bytes with a "
+            f"{len(skin_pab_to_slot)}-entry palette). The strict "
+            f"rebuilder refuses to silently preserve the donor's "
+            f"weights when an export-time skin map exists — that "
+            f"would hide vertex-group deletions. Either re-paint "
+            f"vertex groups in Blender (and re-export the FBX), "
+            f"or remove this submesh from the PAC entirely."
+        )
+    return have_target and new_has_skin
+
+
+def _bone_pab_indices_for_vertex(
+    new_sm,
+    vi: int,
+    pab_to_slot: dict[int, int],
+    sidecar_skeleton_bones: list[str],
+) -> tuple[list[int], list[float]]:
+    """Resolve a single vertex's (PAB indices, weights) for skin
+    write-back, using the strict precedence:
+
+      1. ``new_sm.bone_names[vi]`` paired with ``sidecar_skeleton_bones``
+         — the FBX-import path populates names from cluster Model
+         names, which the sidecar ties to PAB indices.
+      2. ``new_sm.bone_indices[vi]`` directly — when the import path
+         already produced PAB indices (OBJ from sidecar, or FBX with
+         a sidecar that carried ``skeleton_bones`` so the importer
+         resolved names eagerly).
+
+    Returns the dropped pairs ``(pab_indices, weights)``. Pairs whose
+    PAB index isn't in ``pab_to_slot`` are filtered out — they're
+    bones the original PAC submesh never used a slot for, and we
+    refuse to invent one. The caller decides whether to keep the
+    donor's skin bytes or raise.
+
+    Returns ``([], [])`` when the vertex carries no skin data — the
+    caller treats that as "no edit, donor is correct".
+    """
+    bi = (
+        new_sm.bone_indices[vi]
+        if vi < len(new_sm.bone_indices)
+        else ()
+    )
+    bw = (
+        new_sm.bone_weights[vi]
+        if vi < len(new_sm.bone_weights)
+        else ()
+    )
+    if not bi or not bw:
+        return [], []
+
+    name_to_pab = {
+        nm: i for i, nm in enumerate(sidecar_skeleton_bones) if nm
+    }
+
+    bn = (
+        new_sm.bone_names[vi]
+        if vi < len(getattr(new_sm, "bone_names", []) or [])
+        else ()
+    )
+
+    pab_indices: list[int] = []
+    weights: list[float] = []
+    # Length of the source tuples may differ if names came from a
+    # different cluster ordering than indices (rare, but defensive).
+    n = max(len(bi), len(bn) if bn else 0)
+    for k in range(n):
+        # Names take precedence — they're the strict 1+1 source
+        # straight from the FBX cluster's bone Model name.
+        name = bn[k] if k < len(bn) else ""
+        idx_via_name = name_to_pab.get(name) if name else None
+        if idx_via_name is not None:
+            pab = idx_via_name
+        elif k < len(bi):
+            pab = int(bi[k])
+        else:
+            continue
+        if pab not in pab_to_slot:
+            # Bone the original PAC submesh never bound — refuse to
+            # invent a slot. Drop this contribution; the rebuild
+            # will renormalise the remaining weights.
+            continue
+        w = float(bw[k]) if k < len(bw) else 0.0
+        if w <= 0.0:
+            continue
+        pab_indices.append(pab)
+        weights.append(w)
+    return pab_indices, weights
+
+
+def _apply_skin_write_back(
+    rec: bytearray,
+    new_sm,
+    vi: int,
+    pab_to_slot: dict[int, int],
+    sidecar_skeleton_bones: list[str],
+    *,
+    sm_idx: int,
+    sm_name: str,
+) -> bool:
+    """Strict skin write-back for a single rebuilt vertex.
+
+    Returns True when the donor's 8-bone skin bytes (slots at
+    bytes 12-15 + 20-27, weights at bytes 28-35) were overwritten
+    with the user's edited skin data. Returns False when nothing
+    was written — caller leaves the donor's bytes alone.
+
+    Strict refusal:
+      * Empty bone data on the new vertex → returns False
+        (correct: no edit, donor preserved).
+      * ``new_sm`` doesn't satisfy length invariants → ``ValueError``
+        (encode rejection — never silently dropped).
+      * No PAB matched ``pab_to_slot`` for this vertex → returns
+        False; the caller treats that as "no slot for any new
+        bone, donor preserved" (this is the only path that can
+        leave a vertex unwritten while ``pab_to_slot`` is
+        populated, and it's a verifiable strict outcome — the
+        new bones simply don't exist in the original PAC).
+    """
+    pab_indices, weights = _bone_pab_indices_for_vertex(
+        new_sm, vi, pab_to_slot, sidecar_skeleton_bones,
+    )
+    if not pab_indices:
+        return False
+
+    # Slot tuple — 8 entries. Pad with 0 (the engine treats
+    # weight=0 entries as inactive regardless of slot value).
+    slots = [pab_to_slot[p] for p in pab_indices[:8]]
+    while len(slots) < 8:
+        slots.append(0)
+
+    weight_quant = _quantize_weights_to_u8(
+        list(weights[:8]) + [0.0] * max(0, 8 - len(weights)),
+    )
+    try:
+        _pack_pac_skin_into_record(rec, slots, weight_quant)
+    except ValueError as exc:
+        raise ValueError(
+            f"skin encode rejected vertex #{vi} of submesh "
+            f"'{sm_name}' (#{sm_idx}). Detail: {exc}"
+        ) from exc
+    return True
+
+
 def _build_pac_in_place(
     original_mesh: ParsedMesh,
     working_mesh: ParsedMesh,
@@ -3304,12 +3885,34 @@ def _build_pac_in_place(
     vertex_updates: dict[int, bytes] = {}
     index_updates: dict[int, bytes] = {}
 
+    # Top-level skeleton bone-name list shared across submeshes.
+    sidecar = getattr(working_mesh, "_cfmeta_sidecar", None) or {}
+    skeleton_bones_global: list[str] = []
+    if isinstance(sidecar, dict):
+        sb = sidecar.get("skeleton_bones") or []
+        if isinstance(sb, list):
+            skeleton_bones_global = [str(x) for x in sb]
+
     for sm_idx, (orig_sm, new_sm) in enumerate(zip(original_mesh.submeshes, working_mesh.submeshes)):
         if len(orig_sm.vertices) != len(new_sm.vertices):
+            diff = len(new_sm.vertices) - len(orig_sm.vertices)
             raise ValueError(
-                f"PAC submesh {sm_idx} changed vertex count "
-                f"({len(orig_sm.vertices)} -> {len(new_sm.vertices)}). "
-                "Keep the same topology when importing OBJ for PAC meshes."
+                f"PAC submesh {sm_idx} ('{new_sm.name}') changed vertex "
+                f"count ({len(orig_sm.vertices)} -> "
+                f"{len(new_sm.vertices)}, {'+' if diff > 0 else ''}"
+                f"{diff}). PAC vertex slots are donor-locked; the "
+                f"rebuild path can only patch in-place. Common causes:\n"
+                f"  - Edited topology in Blender (added/removed verts).\n"
+                f"  - Custom Split Normals (CSN) at sharp edges: "
+                f"Blender's FBX exporter splits a vertex for each "
+                f"unique (UV, normal) corner pair, but PAC has only "
+                f"per-vertex normal storage. Remove CSN (Object Data "
+                f"Properties > Geometry Data > Clear Custom Split "
+                f"Normals Data) or weld duplicate corners before "
+                f"re-export.\n"
+                f"  - Different UV seams from the donor: same "
+                f"splitting mechanism as CSN; verify the UV map "
+                f"matches the original."
             )
         if len(orig_sm.faces) != len(new_sm.faces):
             raise ValueError(
@@ -3335,6 +3938,19 @@ def _build_pac_in_place(
         clean_shading_records = bool(
             getattr(new_sm, "clean_donor_shading_records", False)
             or getattr(working_mesh, "clean_donor_shading_records", False)
+        )
+        # ── Skin write-back context ──
+        # Decision logic centralised in ``_check_strict_skin_writeback``.
+        # Refuses when sidecar provides a write-back map but FBX
+        # dropped its vertex groups — see helper docstring.
+        skin_pab_to_slot, _skin_known = _resolve_skin_write_context(
+            working_mesh, sm_idx, new_sm.name,
+        )
+        write_skin_for_this_sm = _check_strict_skin_writeback(
+            skin_pab_to_slot,
+            orig_sm.source_vertex_stride,
+            bool(getattr(new_sm, "bone_indices", None)),
+            sm_idx, new_sm.name,
         )
 
         # STRICT MODE — compute MikkTSpace tangents for every vertex of the
@@ -3415,6 +4031,21 @@ def _build_pac_in_place(
                             f"(#{sm_idx}). Detail: {exc}"
                         ) from exc
 
+            # ── Strict skin write-back ──
+            # Overwrite the donor's 8-bone slot+weight bytes with the
+            # user's edited skin data when the sidecar provides the
+            # PAB-to-slot map for this submesh. When it doesn't, the
+            # donor's bytes are preserved verbatim (no fallback —
+            # there's literally no strict source of truth for what
+            # slot values to write without the export-time map).
+            if write_skin_for_this_sm:
+                _apply_skin_write_back(
+                    rec, new_sm, vi,
+                    skin_pab_to_slot,
+                    skeleton_bones_global,
+                    sm_idx=sm_idx, sm_name=new_sm.name,
+                )
+
             payload = bytes(rec)
             prev = vertex_updates.get(rec_off)
             if prev is not None and prev != payload:
@@ -3462,6 +4093,18 @@ def _build_pac_full_rebuild(
     original_data: bytes,
 ) -> bytes:
     """Rebuild PAC geometry sections from scratch for topology-changing imports."""
+    # Top-level skeleton bone-name list (parallel to PAB indices) is
+    # needed at per-vertex skin write-back time to map FBX cluster
+    # names back to PAB indices. Kept here so both the prepare-loop
+    # and the LOD-emit-loop can reach it without re-parsing the
+    # sidecar twice.
+    sidecar = getattr(working_mesh, "_cfmeta_sidecar", None) or {}
+    skeleton_bones_global: list[str] = []
+    if isinstance(sidecar, dict):
+        sb = sidecar.get("skeleton_bones") or []
+        if isinstance(sb, list):
+            skeleton_bones_global = [str(x) for x in sb]
+
     sections = _parse_par_sections(original_data)
     sec_by_idx = {sec["index"]: sec for sec in sections}
     sec0 = sec_by_idx.get(0)
@@ -3607,6 +4250,18 @@ def _build_pac_full_rebuild(
                 f"'{new_sm.name}' (#{sm_idx}). Detail: {exc}"
             ) from exc
 
+        # ── Skin write-back context (full-rebuild path) ──
+        # Same strict 1+1 contract as the in-place path; see helper.
+        skin_pab_to_slot, _skin_known = _resolve_skin_write_context(
+            working_mesh, sm_idx, new_sm.name,
+        )
+        write_skin_for_this_sm = _check_strict_skin_writeback(
+            skin_pab_to_slot,
+            orig_sm.source_vertex_stride,
+            bool(getattr(new_sm, "bone_indices", None)),
+            sm_idx, new_sm.name,
+        )
+
         prepared_submeshes.append({
             "submesh": new_sm,
             "donor_records": donor_records,
@@ -3620,6 +4275,8 @@ def _build_pac_full_rebuild(
             "bbox_extent": extent,
             "stored_lod_count": stored_lod_count,
             "clean_shading_records": clean_shading_records,
+            "skin_pab_to_slot": skin_pab_to_slot,
+            "write_skin": write_skin_for_this_sm,
         })
 
     lod_payloads: dict[int, bytes] = {}
@@ -3644,6 +4301,8 @@ def _build_pac_full_rebuild(
             bbox_min = prepared["bbox_min"]
             bbox_extent = prepared["bbox_extent"]
             clean_shading_records = prepared["clean_shading_records"]
+            skin_pab_to_slot = prepared["skin_pab_to_slot"]
+            write_skin = prepared["write_skin"]
 
             for vi, vertex in enumerate(sm.vertices):
                 donor_rec = bytearray(donor_records[donor_indices[vi]])
@@ -3701,6 +4360,19 @@ def _build_pac_full_rebuild(
                                 f"vertex #{vi} of submesh '{sm.name}' "
                                 f"(#{sm_idx}). Detail: {exc}"
                             ) from exc
+
+                # ── Strict skin write-back (full-rebuild) ──
+                # Same 1+1 contract as the in-place path. Only fires
+                # when the sidecar provided a per-submesh PAB-to-slot
+                # map AND the new submesh carries skin data; donor
+                # bytes are preserved otherwise.
+                if write_skin:
+                    _apply_skin_write_back(
+                        donor_rec, sm, vi,
+                        skin_pab_to_slot,
+                        skeleton_bones_global,
+                        sm_idx=sm_idx, sm_name=sm.name,
+                    )
 
                 verts_buf.extend(donor_rec)
 
@@ -3760,6 +4432,104 @@ def _build_pac_full_rebuild(
         sum(len(sm.faces) for sm in working_mesh.submeshes),
     )
     return bytes(assembled)
+
+
+def build_skin_writeback_sidecar(
+    original_data: bytes, vfs=None, pac_path: str = "",
+    skeleton=None,
+) -> dict:
+    """Build the v2 ``_cfmeta_sidecar`` dict from a donor PAC.
+
+    Strict 1+1 — every entry comes from the donor's actual bytes
+    cross-referenced against a real PAB. There is no fallback path;
+    a missing PAB or palette returns ``skeleton_bones=[]`` and per-
+    submesh ``pab_to_slot={}`` so the caller can see exactly what
+    failed instead of silently substituting guessed values.
+
+    Call this BEFORE :func:`build_pac` and attach the result as
+    ``parsed._cfmeta_sidecar``. With the sidecar present, the
+    strict skin write-back in :func:`_apply_skin_write_back`
+    fires and the user's edited vertex weights end up in the
+    rebuilt PAC's vertex byte slots. Without it, the path that
+    silently preserves donor weights kicks in — which is the
+    ``SILENT FALLBACK`` symptom reported in the byte-diff verifier
+    when a Blender-native FBX (no ``.cfmeta.json`` companion)
+    feeds the standalone Forge.
+
+    Three skeleton-resolution paths:
+
+      * ``skeleton`` provided directly — use it.
+      * ``vfs`` + ``pac_path`` provided — call
+        :func:`core.skeleton_resolver.resolve_skeleton` with the
+        donor bytes (same strict palette-coverage rule the
+        Explorer FBX export uses).
+      * Neither — empty sidecar, write-back stays off.
+    """
+    from core.mesh_parser import (
+        parse_pac, derive_skin_slot_to_pab_geometric,
+    )
+
+    sidecar: dict = {
+        "schema_version": "v2",
+        "skeleton_bones": [],
+        "submeshes": [],
+    }
+    if not original_data:
+        return sidecar
+    try:
+        donor_parsed = parse_pac(original_data, pac_path or "")
+    except Exception:
+        return sidecar
+    if not donor_parsed.submeshes:
+        return sidecar
+
+    # Skeleton resolution.
+    if skeleton is None and vfs is not None and pac_path:
+        try:
+            from core.skeleton_resolver import (
+                VfsManagerAdapter, resolve_skeleton,
+            )
+            adapter = VfsManagerAdapter(vfs)
+            res = resolve_skeleton(
+                pac_path, adapter, pac_bytes=original_data,
+            )
+            skeleton = res.skeleton
+        except Exception:
+            skeleton = None
+
+    if skeleton is None or not getattr(skeleton, "bones", None):
+        # No skeleton -> can't build pab_to_slot. Caller's build_pac
+        # will fall through to donor-preserve (which is the correct
+        # strict response: nothing to write back).
+        for sm in donor_parsed.submeshes:
+            sidecar["submeshes"].append({
+                "name": sm.name,
+                "pab_to_slot": {},
+            })
+        return sidecar
+
+    # Decode the donor's palette in place so bone_indices become
+    # PAB-space (the inverse map below requires that).
+    try:
+        donor_parsed._pac_bytes = original_data
+        derive_skin_slot_to_pab_geometric(donor_parsed, skeleton)
+    except Exception:
+        # Decode failed -> empty maps below; caller sees empty
+        # pab_to_slot and write-back stays off (strict refusal).
+        pass
+
+    sidecar["skeleton_bones"] = [b.name for b in skeleton.bones]
+    for sm in donor_parsed.submeshes:
+        pts: dict = {}
+        try:
+            pts = _build_pab_to_slot_for_submesh(sm, original_data) or {}
+        except Exception:
+            pts = {}
+        sidecar["submeshes"].append({
+            "name": sm.name,
+            "pab_to_slot": {str(k): int(v) for k, v in pts.items()},
+        })
+    return sidecar
 
 
 def build_pac(mesh: ParsedMesh, original_data: bytes) -> bytes:

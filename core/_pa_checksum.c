@@ -3,7 +3,18 @@
  * C extension for Python. ~100x faster than pure Python.
  *
  * Build: python3 setup_checksum.py build_ext --inplace
+ *
+ * Stable ABI / abi3 build: targets the Python 3.11 stable ABI so a
+ * single ``_pa_checksum.cp311-abi3-win_amd64.pyd`` loads on every
+ * CPython 3.11+ — including Blender's bundled interpreter
+ * (Blender 4.2 LTS = 3.11, Blender 5.0/5.1 = 3.13, future = 3.14+).
+ * Without this, the cp<N>-win_amd64 naming locks the .pyd to one
+ * specific Python and Blender silently falls back to the
+ * ``_pa_checksum_python`` pure-Python implementation, which is the
+ * 100x-slower path the docstring warns about.
  */
+
+#define Py_LIMITED_API 0x030B0000
 
 #include <Python.h>
 #include <stdint.h>

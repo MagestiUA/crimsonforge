@@ -92,6 +92,16 @@ class SubMesh:
     faces: list[tuple[int, int, int]] = field(default_factory=list)
     bone_indices: list[tuple[int, ...]] = field(default_factory=list)
     bone_weights: list[tuple[float, ...]] = field(default_factory=list)
+    # Per-vertex bone NAME tuples, parallel to ``bone_indices``. Set
+    # by ``import_fbx`` to the FBX cluster's target Model name (which
+    # is the source skeleton's bone name). Empty everywhere else
+    # (parse_pac doesn't have name info; import_obj doesn't either).
+    # The PAC rebuilder uses these as the strict 1+1 source for
+    # mapping skin back into PAC bytes — when both the v2 sidecar's
+    # ``skeleton_bones`` table and ``bone_names`` are present, the
+    # rebuilder writes the user's edited skin straight back into the
+    # PAC's byte slots; when either is missing it refuses (no fallback).
+    bone_names: list[tuple[str, ...]] = field(default_factory=list)
     vertex_count: int = 0
     face_count: int = 0
     source_vertex_offsets: list[int] = field(default_factory=list)
@@ -2368,6 +2378,28 @@ def derive_skin_slot_to_pab_geometric(
     no bones are emitted un-weighted (they stay in bind position
     when bones rotate, never dragged to a guessed bone).
     """
+    # ── Idempotency guard ──────────────────────────────────────────────
+    # The body of this function MUTATES ``sm.bone_indices`` in place
+    # (line ~2441), replacing 10-bit palette slot indices with full PAB
+    # bone indices. A second call on the same mesh would treat the
+    # already-resolved PAB indices (range 0..N where N can be 400+) as
+    # palette slots and either drop them (idx >= palette_size, scrambling
+    # weights to 0) or remap them to wrong bones (head verts ending up
+    # weighted to finger bones).
+    #
+    # The Right-Click Export Full Character flow already runs ONCE per
+    # click on a fresh ParsedMesh, so this guard is dormant in normal
+    # use. It exists as a safety net so any future workflow (preview
+    # pre-pass, bulk re-export, save-and-resave) that accidentally
+    # re-runs the resolver on the same mesh becomes a safe no-op
+    # instead of corrupting the rig.
+    #
+    # Verified failure mode without this guard (file 03 Test C):
+    # head vertex (97, 347, 346) → second call → (442,) = wrong finger
+    # bone; hand submesh ends up with 0 valid clusters.
+    if getattr(mesh, "_palette_resolved", False):
+        return 0
+
     if not skeleton or not getattr(skeleton, "bones", None):
         return 0
 
@@ -2446,6 +2478,13 @@ def derive_skin_slot_to_pab_geometric(
         "%d hash-not-in-PAB.",
         n_assigned, n_dropped, n_unresolved,
     )
+
+    # Mark the mesh so the idempotency guard at the top of this function
+    # short-circuits any future call on the same ParsedMesh. The slot-
+    # to-PAB indirection is now baked into sm.bone_indices and a second
+    # resolution pass would corrupt it (see file 03 Test C in the
+    # research bundle for the byte-level falsification).
+    mesh._palette_resolved = True
     return n_assigned
 
 

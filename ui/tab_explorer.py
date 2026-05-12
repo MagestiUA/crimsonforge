@@ -86,7 +86,8 @@ class _ArchiveRow:
     Extension and path_lower are pre-computed for instant filtering.
     type_desc is lazy-computed on first access (only visible rows need it).
     """
-    __slots__ = ("entry", "group", "ext", "path_lower", "stem_lower", "size_raw",
+    __slots__ = ("entry", "group", "ext", "path_lower", "stem_lower",
+                 "name_lower", "size_raw",
                  "_size_str", "_type_desc", "checked", "search_extra",
                  "search_display", "_display_tokens")
 
@@ -105,6 +106,10 @@ class _ArchiveRow:
         # Basename: strip everything up to and including the last '/'.
         slash = path_lower.rfind("/")
         basename_lower = path_lower if slash < 0 else path_lower[slash + 1:]
+        # Cache the basename — every complex-query evaluation reads it
+        # against name_lower, and computing it ~1.5 M times per
+        # keystroke via os.path.basename was a measurable cost.
+        self.name_lower = basename_lower
         # Extension: include the leading '.' so callers that compare
         # against ``.pac`` etc. keep working unchanged.
         dot = basename_lower.rfind(".")
@@ -157,9 +162,7 @@ def _match_complex_query(parsed, row, content_loader=None) -> bool:
     qualifiers, wildcards, and phrases delegate to ``evaluate_clause``
     which already does the right thing without per-row tokenization.
     """
-    import fnmatch as _fn
-
-    name_lower = os.path.basename(row.path_lower)
+    name_lower = row.name_lower
     path_lower = row.path_lower
     extra_lower = row.search_extra
     ext_lower = row.ext
@@ -184,7 +187,21 @@ def _match_complex_query(parsed, row, content_loader=None) -> bool:
                        or (extra_lower and val in extra_lower)
                        or val in name_lower)
             elif kind == "wildcard":
-                hit = _fn.fnmatch(path_lower, val) or _fn.fnmatch(name_lower, val)
+                # Use the parse-time compiled regex — fnmatch.fnmatch
+                # internally calls translate + re.match on EVERY
+                # invocation, so doing 1.5 M of those per keystroke
+                # cost ~6.6 s. The pre-compiled regex (cached on the
+                # Clause via fnmatch.translate at parse_query time)
+                # brings it down to ~400 ms — within the keystroke
+                # budget for instant filtering.
+                cre = c.compiled
+                if cre is not None:
+                    hit = (cre.match(path_lower) is not None
+                           or cre.match(name_lower) is not None)
+                else:
+                    import fnmatch as _fn
+                    hit = (_fn.fnmatch(path_lower, val)
+                           or _fn.fnmatch(name_lower, val))
             elif kind == "field":
                 if fld == "ext":
                     wanted = val if val.startswith(".") else f".{val}"
@@ -889,6 +906,21 @@ class ExplorerTab(QWidget):
                         f"Item search ready: "
                         f"{len(self._item_index.items):,} items"
                     )
+                    # ── Strict re-enrichment of already-built rows ──
+                    # _load_all_packages and _load_item_index run in
+                    # parallel. Packages load faster (~3s) than the
+                    # index (~7s scanning 1.5M paths), so rows get
+                    # built with self._item_index == None and end up
+                    # with EMPTY ``search_extra`` / ``search_display``.
+                    # Without this re-enrichment pass, the Catalog
+                    # Browser finds items by alias ("canta") but the
+                    # Explorer search returns 0 — same install, same
+                    # query, two different answers (just4u's report).
+                    # We rebuild aliases for every row now that the
+                    # index is live; the lazy ``_display_tokens``
+                    # cache is invalidated so the next keystroke
+                    # re-tokenizes against fresh aliases.
+                    self._reenrich_rows_with_item_index()
             else:
                 self._item_index = None
                 self._progress.set_status(
@@ -961,8 +993,20 @@ class ExplorerTab(QWidget):
     def _build_row(self, entry: PamtFileEntry, group: str) -> _ArchiveRow:
         """Create one archive row and attach item-name aliases when available."""
         row = _ArchiveRow(entry, group)
+        self._populate_row_aliases(row)
+        return row
+
+    def _populate_row_aliases(self, row) -> None:
+        """Fill in ``row.search_extra`` / ``row.search_display`` from
+        the current item index. Safe to call multiple times — overwrites
+        previous values and resets the lazy ``_display_tokens`` cache.
+
+        Pulled out of ``_build_row`` so the post-index re-enrichment
+        pass and the per-row build path share one strict definition of
+        "alias lookup". Without this both paths drift over time.
+        """
         if not self._item_index or not self._item_index.model_base_aliases:
-            return row
+            return
 
         aliases = []
         display_aliases = []
@@ -978,11 +1022,39 @@ class ExplorerTab(QWidget):
             if disp and disp not in seen_display:
                 seen_display.add(disp)
                 display_aliases.append(disp)
-        if aliases:
-            row.search_extra = " ".join(aliases)
-        if display_aliases:
-            row.search_display = " ".join(display_aliases)
-        return row
+        row.search_extra = " ".join(aliases) if aliases else ""
+        row.search_display = " ".join(display_aliases) if display_aliases else ""
+        # Invalidate the lazy tokenized cache so the next match check
+        # re-tokenizes against the freshly-populated search_display.
+        row._display_tokens = None
+
+    def _reenrich_rows_with_item_index(self) -> None:
+        """Refresh search aliases on every row in the model.
+
+        Runs when ``_load_item_index`` completes AFTER
+        ``_load_all_packages`` (the common case on cold start because
+        the packages worker finishes in ~3 s and the index worker in
+        ~7 s). Without this pass the Explorer's search box stays
+        keyed on path-only matching even after the index is live —
+        the Catalog Browser would find items by display alias while
+        the Explorer returned zero, on the same install.
+
+        Iterates the model's ``_all_rows`` directly: re-enriching
+        ~1.5 M rows in-place is ~120 ms vs. ~3 s to rebuild rows from
+        scratch, and we keep stable row identity (no model reset, no
+        flicker, no loss of check-state).
+        """
+        if not self._model:
+            return
+        rows = getattr(self._model, "_all_rows", None) or []
+        if not rows:
+            return
+        # ``set_filter`` already records the most-recent search text;
+        # re-running the filter post-enrichment surfaces any rows whose
+        # newly-attached aliases now satisfy the active query.
+        for row in rows:
+            self._populate_row_aliases(row)
+        self._apply_filter()
 
     def _candidate_item_alias_keys(self, stem_lower: str) -> list[str]:
         """Return normalized model keys that may map this row to an item name."""
@@ -1282,7 +1354,47 @@ class ExplorerTab(QWidget):
                         if row.entry.path not in scope_paths:
                             scope_paths.append(row.entry.path)
                         break
+
+        # ── Strict fallback: item has no PAC and no icon ─────────────
+        # The catalog carries items that ship without a 3D model OR an
+        # inventory icon (lore items, currency, abstract entries from
+        # gamedata tables). For those records both ``pac_files`` AND
+        # ``icon_paths`` are empty — the previous code silently
+        # returned, leaving the Explorer unchanged and giving the user
+        # no feedback (just4u's "click any item no image, doesn't
+        # return it in explorer" report).
+        #
+        # Strict 1+1: when the canonical paths are empty, scope by
+        # the item's internal name as a substring across every loaded
+        # PAMT. That surfaces gamedata-table entries / loc-string
+        # files / xml records that reference the item by name — at
+        # minimum the user sees SOMETHING (the .gd file the item
+        # came from) instead of an unchanged Explorer.
+        if not scope_paths and self._model is not None:
+            iname = (record.internal_name or "").lower().strip()
+            if iname and len(iname) >= 3:
+                # Match any row whose path contains the internal name
+                # as a substring. Capped at a generous limit so a very
+                # generic name (e.g. ``armor``) doesn't produce a 9 k
+                # scope that's useless to the user; we surface the
+                # top hits and the search bar can refine further.
+                MAX_FALLBACK_HITS = 500
+                for row in self._model._all_rows:
+                    if iname in row.path_lower:
+                        scope_paths.append(row.entry.path)
+                        if len(scope_paths) >= MAX_FALLBACK_HITS:
+                            break
+
         if not scope_paths:
+            # Genuinely no associated files anywhere in the VFS for
+            # this item. Don't fail silently — tell the user via the
+            # status bar so they don't think the click was ignored.
+            display = (record.display_name or record.internal_name
+                       or "this item")
+            self._progress.set_status(
+                f"No PAC / icon / gamedata files reference "
+                f"{display!r} in the loaded VFS."
+            )
             return
         title = record.display_name or record.internal_name or "Catalog selection"
         self._apply_workbench_scope(scope_paths, preferred_path="", title=title)
@@ -1422,6 +1534,29 @@ class ExplorerTab(QWidget):
                     export_full_act.triggered.connect(
                         lambda _=False, e=entry: self._export_full_character(e)
                     )
+                    # NEW: Export Complete Character resolves the
+                    # appearance manifest from the clicked body PAC
+                    # (via the cached <Nude> Prefab → .app_xml index)
+                    # and merges every PAC the manifest names — body,
+                    # face/eyes/teeth/brows, hair, armor — into ONE
+                    # FBX. Always shown for .pac entries; the
+                    # handler shows a clear error when the clicked
+                    # PAC isn't a body PAC referenced by any .app_xml.
+                    export_complete_act = menu.addAction(
+                        "Export Complete Character (FBX)"
+                    )
+                    export_complete_act.setToolTip(
+                        "Resolve this PAC's matching .app_xml and "
+                        "export every part it lists (body + face + "
+                        "hair + armor) as a single skinned + textured "
+                        "FBX. Strict 1+1: refuses if the PAC isn't "
+                        "referenced as <Nude> in any appearance "
+                        "manifest."
+                    )
+                    export_complete_act.triggered.connect(
+                        lambda _=False, e=entry:
+                            self._export_complete_character_from_pac(e)
+                    )
                     menu.addAction("Diagnose dye / tint system").triggered.connect(
                         lambda _=False, e=entry: self._diagnose_dye(e))
                     menu.addSeparator()
@@ -1545,6 +1680,36 @@ class ExplorerTab(QWidget):
                     edit_act.triggered.connect(lambda _=False, e=entry: self._edit_pabgb(e, patch=False))
                     patch_act = menu.addAction("Edit Table + Patch to Game")
                     patch_act.triggered.connect(lambda _=False, e=entry: self._edit_pabgb(e, patch=True))
+                elif file_ext == ".pabgh":
+                    # Header-only editor — pairs with .pabgb body editor
+                    # but lets you edit row hashes / offsets / count
+                    # directly (useful for swapping which body row a
+                    # given index points to).
+                    menu.addSeparator()
+                    entry = click_row_data.entry
+                    edit_act = menu.addAction("Edit Game Data Header")
+                    edit_act.triggered.connect(
+                        lambda _=False, e=entry: self._edit_pabgh(e, patch=False)
+                    )
+                    patch_act = menu.addAction("Edit Header + Patch to Game")
+                    patch_act.triggered.connect(
+                        lambda _=False, e=entry: self._edit_pabgh(e, patch=True)
+                    )
+                elif file_ext in (".paseq", ".paseqc", ".pastage"):
+                    # Sequencer / timeline scripts — drives boss intros,
+                    # cutscenes, BGM swaps, etc. The editor surfaces every
+                    # length-prefixed string (audio events, animation
+                    # paths, Timeline.* commands) for editing.
+                    menu.addSeparator()
+                    entry = click_row_data.entry
+                    edit_act = menu.addAction("Edit Sequencer")
+                    edit_act.triggered.connect(
+                        lambda _=False, e=entry: self._edit_paseq(e, patch=False)
+                    )
+                    patch_act = menu.addAction("Edit Sequencer + Patch to Game")
+                    patch_act.triggered.connect(
+                        lambda _=False, e=entry: self._edit_paseq(e, patch=True)
+                    )
                 elif file_ext == ".prefab":
                     menu.addSeparator()
                     entry = click_row_data.entry
@@ -1566,6 +1731,22 @@ class ExplorerTab(QWidget):
                     edit_act.triggered.connect(
                         lambda _=False, e=entry: self._edit_pac_xml(e)
                     )
+                    # ── Export Complete Character (only for .app_xml) ──
+                    # The .app_xml is the per-character appearance
+                    # manifest — it lists every prefab (and through
+                    # them, every PAC) needed to render a complete
+                    # character. The Export Complete Character action
+                    # follows that chain end-to-end and writes ONE
+                    # merged FBX with body + face + hair + armor +
+                    # textures, all skinned to the shared rig.
+                    if file_ext == ".app_xml":
+                        export_act = menu.addAction(
+                            "Export Complete Character (FBX)"
+                        )
+                        export_act.triggered.connect(
+                            lambda _=False, e=entry:
+                                self._export_complete_character_from_app_xml(e)
+                        )
 
         menu.exec(self._view.viewport().mapToGlobal(pos))
 
@@ -1601,6 +1782,59 @@ class ExplorerTab(QWidget):
             dlg.exec()
         except Exception as e:
             show_error(self, "Table Editor Error", str(e))
+
+    # ------------------------------------------------------------------
+    # .pabgh — header editor. Pairs with the .pabgb body editor above
+    # but lets the user edit the row-hash → byte-offset table directly
+    # (useful for swapping which body row a given character/quest ID
+    # resolves to).
+    # ------------------------------------------------------------------
+    def _edit_pabgh(self, entry: PamtFileEntry, patch: bool = False):
+        """Open the game-data header editor dialog."""
+        try:
+            from ui.dialogs.pabgh_editor_dialog import PabghEditorDialog
+
+            self._progress.set_status(f"Reading {os.path.basename(entry.path)}...")
+            QApplication.processEvents()
+            data = self._vfs.read_entry_data(entry)
+            dlg = PabghEditorDialog(
+                data, entry, self._vfs,
+                patch_mode=patch, parent=self,
+            )
+            self._progress.set_status(
+                f"Opened header editor: {os.path.basename(entry.path)}"
+            )
+            dlg.exec()
+        except Exception as e:
+            show_error(self, "Header Editor Error", str(e))
+
+    # ------------------------------------------------------------------
+    # .paseq / .paseqc / .pastage — sequencer / timeline editor.
+    # Surfaces every length-prefixed string (Wwise event names,
+    # animation paths, Timeline.* commands, type identifiers) for
+    # safe in-place editing via core.paseq_parser.
+    # ------------------------------------------------------------------
+    def _edit_paseq(self, entry: PamtFileEntry, patch: bool = False):
+        """Open the sequencer / timeline editor dialog."""
+        try:
+            from ui.dialogs.paseq_editor_dialog import PaseqEditorDialog
+            from core.paseq_parser import parse_paseq
+
+            self._progress.set_status(f"Parsing {os.path.basename(entry.path)}...")
+            QApplication.processEvents()
+            data = self._vfs.read_entry_data(entry)
+            parsed = parse_paseq(data, file_name=os.path.basename(entry.path))
+            dlg = PaseqEditorDialog(
+                parsed, entry, self._vfs,
+                patch_mode=patch, parent=self,
+            )
+            self._progress.set_status(
+                f"Opened sequencer editor: {os.path.basename(entry.path)} "
+                f"({len(parsed.strings)} strings)"
+            )
+            dlg.exec()
+        except Exception as e:
+            show_error(self, "Sequencer Editor Error", str(e))
 
     def _open_face_parts_browser(self):
         """Build the face-part catalog from the VFS and open the
@@ -2089,9 +2323,16 @@ class ExplorerTab(QWidget):
                         f"explorer.skeleton_override.{rig_prefix}", "",
                     )
                 adapter = VfsManagerAdapter(self._vfs)
+                # Pass PAC bytes for palette-match validation. This is
+                # what fixes the redriverhog/animal case: the prefix
+                # detector returns None for cd_m0002_00_* names so the
+                # ranker falls back to "shortest basename" and picks
+                # phm_01.pab (palette match = 0). Palette-match
+                # validation rejects that and picks the actual hog rig.
                 resolution = resolve_skeleton(
                     entry.path, adapter,
                     manual_override=manual_override or None,
+                    pac_bytes=data,
                 )
                 if resolution.skeleton is not None:
                     skeleton = resolution.skeleton
@@ -2143,6 +2384,7 @@ class ExplorerTab(QWidget):
                             resolution = resolve_skeleton(
                                 entry.path, adapter,
                                 manual_override=override_path,
+                                pac_bytes=data,
                             )
                             if resolution.skeleton is not None:
                                 # Remember the choice per rig class.
@@ -2331,9 +2573,18 @@ class ExplorerTab(QWidget):
             )
         adapter = VfsManagerAdapter(self._vfs)
         try:
+            # Pass PAC bytes for palette-match validation. Without
+            # this, animal/monster meshes (cd_m0002_00_redriverhog,
+            # cd_m0002_00_battlewarthog, etc.) get the wrong rig
+            # because detect_rig_prefix returns None for non-player
+            # asset names and the candidate ranker falls back to
+            # "shortest basename" -> phm_01.pab (player human, 0
+            # palette match) instead of cd_m0002_00_pig.pab (the
+            # actual hog rig with 92 palette matches).
             resolution = resolve_skeleton(
                 entry.path, adapter,
                 manual_override=manual_override or None,
+                pac_bytes=mesh_data,
             )
         except Exception as exc:
             show_error(self, "Skeleton lookup failed", str(exc))
@@ -2361,12 +2612,33 @@ class ExplorerTab(QWidget):
         # with PAB[17,18,27,31] = R/L Thigh, R/L Calf).
 
         # ── Step 3: auto-discover PAA animations matching this rig ──
-        # Walk the loaded VFS, collect every .paa file whose path looks
-        # related to this character / rig. Show them in a picker dialog
-        # — user clicks the one to bake in (or "None" to skip animation).
-        candidate_paas = self._discover_paa_candidates(entry.path, rig_prefix)
-        logger.info("Export Full Character: discovered %d PAA candidates "
-                    "for rig %r", len(candidate_paas), rig_prefix)
+        # Strict 1+1 token-match resolver (replaces the legacy
+        # substring search that surfaced sequencer cinematics like
+        # ``cd_seq_10_damiandinner_phm1_ing_00.paa`` as a damian
+        # animation just because the substring was present).
+        # Returns two buckets: character-specific (charname appears
+        # as a complete underscore-delimited segment of the PAA's
+        # basename) and rig-shared (cd_<rig>_*.paa with no charname).
+        from core.character_animation_resolver import (
+            find_animations_for_character,
+        )
+        anim_result = find_animations_for_character(
+            entry.path, self._vfs,
+            explicit_rig_token=(rig_prefix or "").lower() or None,
+        )
+        candidate_paas = list(anim_result.character_specific) + list(
+            anim_result.rig_shared
+        )
+        logger.info(
+            "Export Full Character: animation resolver — char_token=%r, "
+            "rig_token=%r, character-specific=%d, rig-shared=%d, "
+            "reason=%r",
+            anim_result.char_token,
+            anim_result.rig_token,
+            len(anim_result.character_specific),
+            len(anim_result.rig_shared),
+            anim_result.failure_reason,
+        )
 
         animation = None
         anim_label = ""
@@ -2507,6 +2779,46 @@ class ExplorerTab(QWidget):
         if animation is not None:
             basename += "_anim"
 
+        # ── Step 4b: resolve textures from the .pac_xml companion ──
+        # Strict, no-fallback chain (see
+        # test_only/research/2026-05-08_fbx_export_pipeline/
+        # 14_texture_resolution_chain.md). Returns one record per
+        # submesh naming the canonical VFS path of every bound
+        # texture. When a Material has no _baseColorTexture and no
+        # _overlayColorTexture (procedural mask-driven shaders,
+        # ~23% of real Materials) the corresponding base_color is
+        # None — the FBX exporter then leaves that submesh's
+        # Material with no diffuse binding rather than guessing.
+        try:
+            from core.pac_xml_texture_resolver import (
+                resolve_pac_textures, vfs_manager_texture_view,
+            )
+            tex_view = vfs_manager_texture_view(self._vfs)
+            tex_manifest = resolve_pac_textures(
+                entry.path, tex_view,
+                [sm.name for sm in mesh.submeshes],
+            )
+            n_with_base = sum(1 for r in tex_manifest.records
+                              if r.base_color)
+            logger.info(
+                "Full Character textures: has_xml=%s, "
+                "submeshes=%d, base_color=%d/%d, reason=%r",
+                tex_manifest.has_xml,
+                len(tex_manifest.records),
+                n_with_base, len(tex_manifest.records),
+                tex_manifest.failure_reason or '',
+            )
+        except Exception as exc:
+            # Texture resolution must NEVER block the export. If the
+            # XML companion is missing or unparseable we still ship
+            # the mesh+skeleton FBX without textures.
+            logger.warning(
+                "Full Character: texture resolver raised %s — "
+                "exporting without textures", exc,
+            )
+            tex_manifest = None
+            tex_view = None
+
         try:
             self._progress.set_status(
                 f"Exporting full character FBX to {output_dir}..."
@@ -2523,6 +2835,8 @@ class ExplorerTab(QWidget):
                 filter_unskinned_outliers=False,
                 animation=animation,
                 fps=30.0,
+                textures=tex_manifest,
+                texture_vfs=tex_view,
             )
         except Exception as exc:
             show_error(self, "FBX export failed", str(exc))
@@ -2530,6 +2844,24 @@ class ExplorerTab(QWidget):
 
         # ── Step 6: show summary ──
         rig_label = os.path.basename(resolution.pab_path) if resolution.pab_path else "?"
+        # Texture summary lines — only when the resolver produced
+        # records, so the dialog stays clean for legacy paths.
+        tex_lines = ""
+        if tex_manifest is not None and tex_manifest.records:
+            n_base = sum(1 for r in tex_manifest.records
+                         if r.base_color)
+            from core.pac_xml_texture_resolver import collect_unique_dds_paths
+            n_files = len(collect_unique_dds_paths(tex_manifest))
+            tex_lines = (
+                f"Textures: {n_base}/{len(tex_manifest.records)} "
+                f"submeshes have a base color, {n_files} unique DDS "
+                f"saved to {basename}_textures/\n"
+            )
+        elif tex_manifest is not None and tex_manifest.failure_reason:
+            tex_lines = (
+                f"Textures: not exported "
+                f"({tex_manifest.failure_reason})\n"
+            )
         show_info(
             self,
             "Full Character Exported",
@@ -2539,10 +2871,187 @@ class ExplorerTab(QWidget):
             f"{len(mesh.submeshes)} submeshes\n"
             f"Skeleton: {len(skeleton.bones)} bones (rig {rig_label}, "
             f"source {resolution.source})\n"
-            f"Animation:{anim_label or ' none'}\n\n"
-            f"Sidecar: {os.path.basename(fbx_path)}.cfmeta.json (preserves "
+            f"Animation:{anim_label or ' none'}\n"
+            f"{tex_lines}"
+            f"\nSidecar: {os.path.basename(fbx_path)}.cfmeta.json (preserves "
             f"spike-filter for round-trip)\n"
             f"Debug log: {os.path.basename(fbx_path)}.debug.txt"
+        )
+
+    def _export_complete_character_from_app_xml(
+        self, entry: PamtFileEntry,
+    ):
+        """Right-click handler for ``.app_xml`` entries. Delegates
+        to the path-based exporter using the entry's verbatim path
+        — no name guessing, no companion search.
+        """
+        self._export_complete_character_from_path(entry.path)
+
+    def _export_complete_character_from_pac(
+        self, entry: PamtFileEntry,
+    ):
+        """Right-click handler for ``.pac`` entries.
+
+        Strict reverse lookup:
+          * Treat the clicked PAC as the body PAC of a character.
+          * Search every ``character/*.app_xml`` whose ``<Nude>``
+            ``<Prefab Name="...">`` equals the clicked PAC's
+            basename stem (cached after first scan).
+          * Exactly one hit → call the path-based exporter on it.
+          * Multiple hits → show a picker so the user resolves
+            which appearance variant they want.
+          * Zero hits → strict refusal with an error dialog
+            naming the body-PAC stem we looked for.
+        """
+        from ui.dialogs.confirmation import show_error
+        from core.character_appearance_resolver import (
+            find_app_xmls_for_body_pac,
+        )
+
+        try:
+            hits = find_app_xmls_for_body_pac(entry.path, self._vfs)
+        except Exception as exc:
+            show_error(
+                self, "Export Complete Character — lookup failed",
+                f"Couldn't scan appearance manifests:\n\n{exc}",
+            )
+            return
+
+        if not hits:
+            stem = os.path.splitext(
+                os.path.basename(entry.path.replace("\\", "/"))
+            )[0]
+            show_error(
+                self, "No appearance manifest found",
+                f"None of the .app_xml files in character/ list "
+                f"\"{stem}\" as their <Nude> Prefab.\n\n"
+                f"This action only works for body PACs (the ones "
+                f"named in <Nude>). For accessory PACs (head, hair, "
+                f"armor pieces) right-click the matching "
+                f".app_xml directly."
+            )
+            return
+
+        if len(hits) == 1:
+            self._export_complete_character_from_path(hits[0])
+            return
+
+        # Multiple appearance variants share this body PAC — let
+        # the user pick which one.
+        from PySide6.QtWidgets import QInputDialog
+        choices = [os.path.basename(h) for h in hits]
+        picked, ok = QInputDialog.getItem(
+            self,
+            "Choose Appearance",
+            f"This body PAC is used by {len(hits)} appearance "
+            f"variants. Which one should I export?",
+            choices, 0, False,
+        )
+        if not ok or not picked:
+            return
+        # Map back from basename to full path (basenames are
+        # unique because they're per-character VFS paths).
+        for h in hits:
+            if os.path.basename(h) == picked:
+                self._export_complete_character_from_path(h)
+                return
+
+    def _export_complete_character_from_path(
+        self, app_xml_path: str,
+    ):
+        """Export every PAC named by ``app_xml_path`` as one merged FBX.
+
+        Pipeline (strict 1+1, no fallback):
+          1. Resolve the appearance manifest from the .app_xml.
+          2. Walk every <Prefab Name="..."> in <Nude>/<Head>/<Hair>/
+             <Armor>; locate each prefab in the VFS.
+          3. Extract every PAC reference from each prefab.
+          4. Read+parse every PAC; resolve a SHARED skeleton from
+             the body PAC's palette match; per-PAC palette resolve;
+             per-PAC texture resolve.
+          5. Merge all submeshes + texture manifests; export ONE
+             FBX with all parts skinned to the shared rig.
+        """
+        from ui.dialogs.file_picker import pick_directory
+        from ui.dialogs.confirmation import show_error, show_info
+
+        # ── Step 1: pick output dir ──
+        output_dir = pick_directory(
+            self, "Choose FBX output directory",
+        )
+        if not output_dir:
+            return
+
+        # ── Step 2: derive a clean basename from the .app_xml ──
+        # cd_phw_damian_00000.app_xml -> cd_phw_damian_00000_complete
+        clean_path = app_xml_path.replace("\\", "/")
+        stem = os.path.splitext(os.path.basename(clean_path))[0]
+        basename = f"{stem}_complete"
+
+        # ── Step 3: invoke the strict orchestrator ──
+        try:
+            self._progress.set_status(
+                f"Exporting complete character from "
+                f"{os.path.basename(clean_path)} to {output_dir}..."
+            )
+            from core.character_complete_exporter import (
+                export_complete_character,
+            )
+            result = export_complete_character(
+                app_xml_path, output_dir, basename, self._vfs,
+            )
+        except Exception as exc:
+            logger.exception(
+                "export_complete_character raised: %s", exc,
+            )
+            show_error(
+                self, "Export Complete Character — failed",
+                f"The export pipeline raised an exception:\n\n{exc}",
+            )
+            return
+
+        # ── Step 4: surface the result ──
+        if result.failure_reason:
+            show_error(
+                self, "Export Complete Character — failed",
+                f"{result.failure_reason}\n\n"
+                f"PACs requested: {len(result.pacs_requested)}\n"
+                f"PACs loaded   : {len(result.pacs_loaded)}\n"
+                f"PACs skipped  : {len(result.pacs_skipped)}",
+            )
+            return
+
+        # Build a per-prefab summary line so the user sees what
+        # came in — useful when a prefab silently produced 0 PACs.
+        skipped_lines = ""
+        if result.pacs_skipped:
+            skipped_lines = "\nPACs skipped:\n" + "\n".join(
+                f"  {p}: {r}" for p, r in result.pacs_skipped[:10]
+            )
+            if len(result.pacs_skipped) > 10:
+                skipped_lines += (
+                    f"\n  ... +{len(result.pacs_skipped) - 10} more"
+                )
+
+        show_info(
+            self, "Complete Character Exported",
+            f"Wrote {result.fbx_path}\n\n"
+            f"Manifest: {result.app_xml_path}\n"
+            f"PACs    : {len(result.pacs_loaded)}/"
+            f"{len(result.pacs_requested)} loaded "
+            f"({len(result.pacs_skipped)} skipped)\n"
+            f"Skeleton: {result.skeleton_bone_count} bones "
+            f"({os.path.basename(result.skeleton_pab_path)})\n"
+            f"Mesh    : {result.total_vertices:,} verts, "
+            f"{result.total_faces:,} faces, "
+            f"{result.total_submeshes} submeshes\n"
+            f"Textures: {result.unique_textures} unique DDS, "
+            f"{result.base_color_count}/{result.total_submeshes} "
+            f"submeshes have a base color\n"
+            f"{skipped_lines}\n"
+            f"\nDDS folder: {basename}_textures/\n"
+            f"Sidecar   : {basename}.fbx.cfmeta.json\n"
+            f"Debug log : {basename}.fbx.debug.txt"
         )
 
     def _extract_pab_bone_hashes(self, pab_path: str) -> list[int]:
@@ -2682,78 +3191,6 @@ class ExplorerTab(QWidget):
                 if (entry.path or "").replace("\\", "/").lower() == target:
                     return entry
         return None
-
-    def _discover_paa_candidates(self, mesh_path: str,
-                                  rig_prefix: str | None) -> list[str]:
-        """Scan the loaded VFS for .paa files relevant to this rig.
-
-        Strategy (in order of preference):
-          1. PAAs that contain the FULL character name in the path
-             (e.g. 'damian' for cd_phw_00_nude_00_0001_damian.pac).
-          2. PAAs whose path contains the rig prefix (e.g. 'cd_phw_00_').
-          3. PAAs in any 'animation' folder matching the broad 'cd_ph[wm]'
-             family (fallback for shared animations).
-
-        Returns paths sorted by relevance (best match first), capped at
-        500 entries to keep the picker dialog responsive.
-        """
-        # Extract the character name from the mesh path. PAC convention:
-        # cd_<rig>_<NN>_<part>_<NNNN>_<NN>_<charname>.pac → charname is
-        # the trailing identifier after the last underscore.
-        mesh_basename = os.path.splitext(os.path.basename(mesh_path))[0]
-        parts = mesh_basename.split("_")
-        char_name = parts[-1] if len(parts) >= 4 else ""
-        char_name_lc = char_name.lower() if char_name else ""
-
-        rig_prefix_lc = (rig_prefix or "").lower()
-        # Trim the rig prefix back to its broad family (cd_phw_00_ →
-        # cd_phw_) so we still match shared animations that drop the LOD
-        # number from their path.
-        rig_family_lc = rig_prefix_lc
-        if rig_family_lc:
-            family_parts = rig_family_lc.rstrip("_").split("_")
-            if len(family_parts) >= 2:
-                rig_family_lc = "_".join(family_parts[:2])
-
-        seen: set[str] = set()
-        char_hits: list[str] = []
-        rig_hits: list[str] = []
-        family_hits: list[str] = []
-
-        # Walk every loaded PAMT — _pamt_cache holds them all after the
-        # game-load step that runs at app startup.
-        for _group, pamt in getattr(self._vfs, "_pamt_cache", {}).items():
-            for entry in getattr(pamt, "file_entries", []):
-                p = entry.path
-                if not p or p in seen:
-                    continue
-                p_lc = p.lower()
-                if not p_lc.endswith(".paa"):
-                    continue
-                seen.add(p)
-
-                if char_name_lc and char_name_lc in p_lc:
-                    char_hits.append(p)
-                elif rig_prefix_lc and rig_prefix_lc in p_lc:
-                    rig_hits.append(p)
-                elif (rig_family_lc and rig_family_lc in p_lc
-                      and "/animation" in p_lc.replace("\\", "/")):
-                    family_hits.append(p)
-
-        # Sort each bucket alphabetically for a stable list.
-        char_hits.sort()
-        rig_hits.sort()
-        family_hits.sort()
-
-        # Combine in priority order, dedupe (a file can match multiple
-        # buckets — keep first match).
-        combined: list[str] = []
-        for bucket in (char_hits, rig_hits, family_hits):
-            for p in bucket:
-                if p not in combined:
-                    combined.append(p)
-
-        return combined[:500]
 
     def _prompt_pick_paa(self, candidates: list[str],
                          rig_prefix: str) -> str | None:
@@ -3136,6 +3573,21 @@ class ExplorerTab(QWidget):
             ext = os.path.splitext(entry.path.lower())[1]
             imported.format = "pac" if ext == ".pac" else "pamlod" if ext == ".pamlod" else "pam"
 
+            # Build the strict skin write-back sidecar from the donor
+            # PAC + its sibling PAB. Without this, FBX files coming
+            # from Blender's native exporter (which lack the
+            # ``.cfmeta.json`` companion that CF's own export writes)
+            # produce a silent fallback where painted weights are
+            # ignored and donor bytes survive verbatim. With the
+            # sidecar attached, ``build_pac``'s strict write-back
+            # fires and writes user-edited weights into the PAC's
+            # vertex byte slots.
+            if fmt == "fbx":
+                from core.mesh_importer import build_skin_writeback_sidecar
+                imported._cfmeta_sidecar = build_skin_writeback_sidecar(
+                    original_data, vfs=self._vfs, pac_path=entry.path,
+                )
+
             # Build new binary
             new_data = build_mesh(imported, original_data)
 
@@ -3220,6 +3672,15 @@ class ExplorerTab(QWidget):
             imported.path = entry.path
             ext = os.path.splitext(entry.path.lower())[1]
             imported.format = "pac" if ext == ".pac" else "pamlod" if ext == ".pamlod" else "pam"
+
+            # Same strict skin write-back sidecar as the preview-
+            # only flow. Without this, Blender-native FBX imports
+            # land in the silent-donor-preserve branch.
+            if fmt == "fbx":
+                from core.mesh_importer import build_skin_writeback_sidecar
+                imported._cfmeta_sidecar = build_skin_writeback_sidecar(
+                    original_data, vfs=self._vfs, pac_path=entry.path,
+                )
 
             # Build new binary
             new_data = build_mesh(imported, original_data)
@@ -3412,6 +3873,17 @@ class ExplorerTab(QWidget):
                 else "pamlod" if ext == ".pamlod"
                 else "pam"
             )
+
+            # Strict skin write-back sidecar — see the corresponding
+            # comment block in ``_import_mesh``. Without this, FBX
+            # files exported by Blender's native exporter (no
+            # ``.cfmeta.json`` companion) silently preserve donor
+            # weights instead of applying the user's vertex paint.
+            if fmt == "fbx":
+                from core.mesh_importer import build_skin_writeback_sidecar
+                imported._cfmeta_sidecar = build_skin_writeback_sidecar(
+                    original_data, vfs=self._vfs, pac_path=entry.path,
+                )
 
             new_data = build_mesh(imported, original_data)
 
