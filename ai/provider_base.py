@@ -4,6 +4,7 @@ Defines the common interface that every AI provider must implement:
 list_models, translate, and test_connection.
 """
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
@@ -66,6 +67,7 @@ class AIProviderBase(ABC):
         self._base_url = base_url
         self._timeout = timeout
         self._max_retries = max_retries
+        self._stop_event = threading.Event()
 
     @abstractmethod
     def list_models(self) -> list[ModelInfo]:
@@ -147,6 +149,23 @@ class AIProviderBase(ABC):
             self._timeout = timeout
         if max_retries > 0:
             self._max_retries = max_retries
+
+    def request_stop(self) -> None:
+        """Signal any in-flight translate() retry loop on this instance to
+        abort immediately instead of sleeping out its remaining backoff
+        delay - without this, Stop could take up to RATE_LIMIT_WAIT_S or
+        SERVER_ERROR_WAIT_S seconds per lane to actually take effect when
+        many concurrent lanes each own a retry loop."""
+        self._stop_event.set()
+
+    def reset_stop(self) -> None:
+        """Clear a previous stop signal so this instance can be reused for
+        a new run - otherwise a stale stop from a prior run would make
+        every subsequent translate() call return immediately as 'stopped'."""
+        self._stop_event.clear()
+
+    def _stopped(self) -> bool:
+        return self._stop_event.is_set()
 
     def prepare_for_batch(self, sample_texts: list[str], system_prompt: str = "") -> None:
         """Optional hook called once before a batch translation run starts.

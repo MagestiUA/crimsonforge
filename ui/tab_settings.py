@@ -291,6 +291,24 @@ class SettingsTab(QWidget):
         self._batch_delay.setSuffix(" ms")
         form.addRow("Batch Delay:", self._batch_delay)
 
+        self._parallel_workers = QSpinBox()
+        self._parallel_workers.setToolTip(
+            "Number of independent parallel lanes for 'Auto-Translate All'. "
+            "Each lane runs its own translation batch concurrently, with no "
+            "artificial pacing between them - relies entirely on the "
+            "provider's own rate-limit handling.\n"
+            "Only safe for providers with generous/dynamic concurrency "
+            "limits (e.g. DeepSeek - limits are per-account and load-based, "
+            "not a strict per-minute quota). A provider with a hard, low "
+            "per-minute cap on a free tier (e.g. Gemini free tier) will "
+            "just spread 429 errors across lanes instead of going faster.\n"
+            "1 = old sequential behavior. Not useful for Ollama - a local "
+            "GPU has nothing to gain from parallel requests."
+        )
+        self._parallel_workers.setRange(1, 100)
+        self._parallel_workers.setValue(self._config.get("translation.parallel_workers", 1))
+        form.addRow("Parallel Workers:", self._parallel_workers)
+
         self._system_prompt = QTextEdit()
         self._system_prompt.setToolTip(
             "System prompt sent to the AI with every translation request.\n"
@@ -463,6 +481,7 @@ class SettingsTab(QWidget):
         self._config.set("translation.autosave_interval_seconds", self._autosave_interval.value())
         self._config.set("translation.batch_size", self._batch_size.value())
         self._config.set("translation.batch_delay_ms", self._batch_delay.value())
+        self._config.set("translation.parallel_workers", self._parallel_workers.value())
         self._config.set("translation.system_prompt", self._system_prompt.toPlainText())
         self._config.set("translation.user_prompt_template", self._user_prompt.text())
 

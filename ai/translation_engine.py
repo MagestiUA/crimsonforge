@@ -199,6 +199,7 @@ class TranslationEngine:
         The result object stores the FINAL decoded translation,
         so downstream consumers never see a sentinel.
         """
+        self._provider.reset_stop()
         glossary = getattr(self, "_glossary_text", "")
         system_prompt = self._prompt_manager.get_system_prompt(
             source_lang, target_lang, glossary_text=glossary
@@ -321,6 +322,20 @@ class TranslationEngine:
         one-at-a-time: usually only one item in a large chunk is actually
         the problem, and splitting isolates it in ~log2(n) extra calls
         instead of paying for n individual calls every time."""
+        if self._stop_requested:
+            return [
+                TranslationResult(
+                    translated_text="",
+                    source_text=req.text,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    model_used=model,
+                    provider=self._provider.provider_id,
+                    error="Translation stopped by user",
+                    success=False,
+                )
+                for req in chunk_requests
+            ]
         if len(chunk_requests) == 1:
             return self._translate_individually(
                 chunk_requests, source_lang, target_lang, model, single_system_prompt,
@@ -438,6 +453,7 @@ class TranslationEngine:
         """
         self._state = BatchState.RUNNING
         self._stop_requested = False
+        self._provider.reset_stop()
         total = len(requests)
         if total == 0:
             self._state = BatchState.COMPLETED
@@ -504,6 +520,9 @@ class TranslationEngine:
         self._stop_requested = True
         self._pause_event.set()
         self._state = BatchState.STOPPING
+        # Wakes up any in-flight retry backoff sleep inside the provider
+        # instead of leaving it to sleep out its full remaining delay.
+        self._provider.request_stop()
         logger.info("Translation stop requested")
 
     @property

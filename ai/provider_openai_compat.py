@@ -95,7 +95,23 @@ class OpenAICompatProvider(AIProviderBase):
         start_time = time.time()
         rate_limit_retries = 0
         server_error_retries = 0
+
+        def _stopped_result() -> TranslationResult:
+            return TranslationResult(
+                translated_text="",
+                source_text=text,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                model_used=model,
+                provider=self.provider_id,
+                latency_ms=(time.time() - start_time) * 1000,
+                error="Translation stopped by user",
+                success=False,
+            )
+
         while True:
+            if self._stopped():
+                return _stopped_result()
             try:
                 client = self._get_client()
                 extra_body = self._extra_body() if hasattr(self, "_extra_body") else None
@@ -169,7 +185,7 @@ class OpenAICompatProvider(AIProviderBase):
                     "%s rate-limited (429) - waiting %ds before retry %d/%d",
                     self.name, RATE_LIMIT_WAIT_S, rate_limit_retries, RATE_LIMIT_MAX_RETRIES,
                 )
-                time.sleep(RATE_LIMIT_WAIT_S)
+                self._stop_event.wait(RATE_LIMIT_WAIT_S)
                 continue
             except InternalServerError as e:
                 server_error_retries += 1
@@ -194,7 +210,7 @@ class OpenAICompatProvider(AIProviderBase):
                     "%s server error (5xx) - waiting %ds before retry %d/%d",
                     self.name, SERVER_ERROR_WAIT_S, server_error_retries, SERVER_ERROR_MAX_RETRIES,
                 )
-                time.sleep(SERVER_ERROR_WAIT_S)
+                self._stop_event.wait(SERVER_ERROR_WAIT_S)
                 continue
             except Exception as e:
                 latency = (time.time() - start_time) * 1000

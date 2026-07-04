@@ -1141,15 +1141,28 @@ class TranslateTab(QWidget):
             show_error(self, "Error", "Load a language file first.")
             return
 
-        engine = TranslationEngine(
-            provider=provider,
-            prompt_manager=self._prompt_manager,
-            batch_size=self._config.get("translation.batch_size", 10),
-            batch_delay_ms=self._config.get("translation.batch_delay_ms", 500),
-        )
-        engine.set_glossary(self._get_glossary_prompt())
         reference_languages = self._build_reference_language_maps()
-        self._batch_processor = TranslationBatchProcessor(engine, self._project, reference_languages)
+        num_workers = self._config.get("translation.parallel_workers", 1)
+        if num_workers > 1:
+            from translation.concurrent_batch import ConcurrentTranslationBatchProcessor
+            self._batch_processor = ConcurrentTranslationBatchProcessor(
+                provider=provider,
+                prompt_manager=self._prompt_manager,
+                project=self._project,
+                num_lanes=num_workers,
+                batch_size=self._config.get("translation.batch_size", 10),
+            )
+            self._batch_processor.set_glossary(self._get_glossary_prompt())
+            self._batch_processor.set_reference_languages(reference_languages)
+        else:
+            engine = TranslationEngine(
+                provider=provider,
+                prompt_manager=self._prompt_manager,
+                batch_size=self._config.get("translation.batch_size", 10),
+                batch_delay_ms=self._config.get("translation.batch_delay_ms", 500),
+            )
+            engine.set_glossary(self._get_glossary_prompt())
+            self._batch_processor = TranslationBatchProcessor(engine, self._project, reference_languages)
 
         self._auto_translate_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
