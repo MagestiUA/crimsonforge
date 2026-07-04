@@ -147,7 +147,7 @@ class ConfigManager:
             "translation": {
                 "autosave_enabled": True,
                 "autosave_interval_seconds": 30,
-                "batch_size": 10,
+                "batch_size": 20,
                 "batch_delay_ms": 500,
                 "max_concurrent_requests": 3,
                 "default_source_lang": "en",

@@ -127,6 +127,19 @@ class SettingsTab(QWidget):
             else:
                 tts_model_combo.setEnabled(False)
 
+            if provider_id == "ollama":
+                quant_note = QLabel(
+                    "Context window is fixed at 64k tokens for translation batches. "
+                    "Reasoning/thinking is always off for translation.\nKV-cache "
+                    "quantization (q4_0) + flash attention are applied automatically "
+                    "when CrimsonForge starts the Ollama server itself.\nIf Ollama is "
+                    "already running unquantized, quit it fully once (tray icon) and "
+                    "press Test Connection to let CrimsonForge start it quantized."
+                )
+                quant_note.setWordWrap(True)
+                quant_note.setStyleSheet("color: #a6adc8; font-size: 11px; padding: 4px;")
+                form.addRow("", quant_note)
+
             test_btn = QPushButton("Test Connection")
             test_btn.setToolTip("Test the API connection and verify your API key works.")
             test_result = QLabel("")
@@ -256,9 +269,19 @@ class SettingsTab(QWidget):
         form.addRow("Autosave Interval:", self._autosave_interval)
 
         self._batch_size = QSpinBox()
-        self._batch_size.setToolTip("Number of strings sent to the AI in each batch request.\nLarger = faster but uses more tokens per request. Recommended: 5-20.")
+        self._batch_size.setToolTip(
+            "Max strings grouped into a single JSON-array AI request.\n"
+            "Higher = fewer round-trips and less repeated system-prompt "
+            "overhead - but local models can degrade sharply past a point "
+            "(measured: 20 items/batch was fast and reliable on Ollama + "
+            "Gemma4; 100 items/batch effectively stalled). A batch that "
+            "fails to parse falls back to translating it one string at a "
+            "time, which is slower. Recommended: 15-25 for local models, "
+            "higher may be fine for hosted cloud models - test before "
+            "committing to a large run."
+        )
         self._batch_size.setRange(1, 100)
-        self._batch_size.setValue(self._config.get("translation.batch_size", 10))
+        self._batch_size.setValue(self._config.get("translation.batch_size", 20))
         form.addRow("Batch Size:", self._batch_size)
 
         self._batch_delay = QSpinBox()
