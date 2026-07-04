@@ -30,6 +30,7 @@ from core.papgt_manager import (
     update_papgt_pamt_crc, update_papgt_self_crc,
 )
 from core.backup_manager import BackupManager
+from translation import checkpoint_journal
 from translation.language_config import LanguageConfig
 from translation.translation_state import TranslationEntry, StringStatus
 from translation.translation_project import TranslationProject
@@ -811,6 +812,7 @@ class TranslateTab(QWidget):
                 try:
                     candidate = TranslationProject()
                     candidate.load(recovery_path)
+                    checkpoint_journal.merge_into(candidate)
                     if candidate.source_file == filename:
                         saved_project = candidate
                         logger.info(
@@ -965,6 +967,7 @@ class TranslateTab(QWidget):
         try:
             self._project = TranslationProject()
             self._project.load(path)
+            checkpoint_journal.merge_into(self._project)
             merge = self._merge_with_fresh_game_data()
             self._apply_usage_tags(rebuild=True)
             self._reload_table()
@@ -1048,6 +1051,16 @@ class TranslateTab(QWidget):
 
     def _resume_translate(self):
         if self._batch_processor:
+            provider, _, _ = self._get_ai_provider_and_model()
+            if provider is not None:
+                try:
+                    provider.ensure_ready()
+                except Exception as e:
+                    show_error(
+                        self, "Resume Error",
+                        f"AI provider isn't reachable - fix it before resuming: {e}",
+                    )
+                    return
             self._batch_processor.resume()
             self._pause_btn.setEnabled(True)
             self._resume_btn.setEnabled(False)
@@ -1149,6 +1162,18 @@ class TranslateTab(QWidget):
         self._progress.set_progress(100, f"Done: {succeeded}/{len(results)} translated, {len(failed)} failed")
         self._update_stats()
         self._autosave.notify_change()
+
+        # Flush the full project now rather than waiting up to
+        # autosave_interval_seconds for the periodic timer - the checkpoint
+        # journal already protected every entry during the run, but a
+        # prompt full save here clears it out and gives Stop/Pause a
+        # fresh, complete JSON immediately.
+        try:
+            recovery_dir = os.path.join(os.path.expanduser("~"), ".crimsonforge")
+            os.makedirs(recovery_dir, exist_ok=True)
+            self._project.save(os.path.join(recovery_dir, "autosave_project.json"))
+        except Exception as e:
+            logger.error("Failed to save project after batch completion: %s", e)
 
     def _on_translation_edited(self, index: int, text: str):
         entry = self._project.get_entry(index)
@@ -1874,6 +1899,7 @@ class TranslateTab(QWidget):
         try:
             self._project = TranslationProject()
             self._project.load(recovery_path)
+            checkpoint_journal.merge_into(self._project)
 
             ui_state = {}
             if os.path.isfile(ui_path):

@@ -6,6 +6,7 @@ their states, and metadata. Projects can be saved and reopened later.
 
 import json
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,13 @@ class TranslationProject:
         self._source_file: str = ""
         self._project_file: str = ""
         self._modified: bool = False
+        # Guards save() - the periodic AutosaveManager timer (UI thread) and
+        # a batch translation's per-chunk checkpoint (worker thread) can both
+        # try to write the same file at once. Without this, two concurrent
+        # writers racing on the same "<path>.tmp" produce WinError 32 on
+        # Windows (os.replace fails while the other writer still has the
+        # tmp file open).
+        self._save_lock = threading.Lock()
         self._created_at: str = ""
         self._updated_at: str = ""
         self._game_build_id: str = ""
@@ -97,40 +105,48 @@ class TranslationProject:
         Returns:
             Path the project was saved to.
         """
-        if path:
-            self._project_file = path
-        if not self._project_file:
-            raise ValueError(
-                "No project file path specified. Use save(path) to set the save location."
-            )
+        with self._save_lock:
+            if path:
+                self._project_file = path
+            if not self._project_file:
+                raise ValueError(
+                    "No project file path specified. Use save(path) to set the save location."
+                )
 
-        self._updated_at = datetime.now().isoformat()
+            self._updated_at = datetime.now().isoformat()
 
-        data = {
-            "version": "1.0.0",
-            "source_lang": self._source_lang,
-            "target_lang": self._target_lang,
-            "source_file": self._source_file,
-            "game_build_id": self._game_build_id,
-            "game_build_display": self._game_build_display,
-            "game_fingerprint": self._game_fingerprint,
-            "update_history": self._update_history,
-            "last_sync_summary": self._last_sync_summary,
-            "created_at": self._created_at,
-            "updated_at": self._updated_at,
-            "entry_count": len(self._entries),
-            "stats": self._compute_stats(),
-            "entries": [e.to_dict() for e in self._entries],
-        }
+            data = {
+                "version": "1.0.0",
+                "source_lang": self._source_lang,
+                "target_lang": self._target_lang,
+                "source_file": self._source_file,
+                "game_build_id": self._game_build_id,
+                "game_build_display": self._game_build_display,
+                "game_fingerprint": self._game_fingerprint,
+                "update_history": self._update_history,
+                "last_sync_summary": self._last_sync_summary,
+                "created_at": self._created_at,
+                "updated_at": self._updated_at,
+                "entry_count": len(self._entries),
+                "stats": self._compute_stats(),
+                "entries": [e.to_dict() for e in self._entries],
+            }
 
-        Path(self._project_file).parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._project_file + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, self._project_file)
+            Path(self._project_file).parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._project_file + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, self._project_file)
 
-        self._modified = False
-        logger.info("Project saved: %s", self._project_file)
+            self._modified = False
+            logger.info("Project saved: %s", self._project_file)
+
+        # Outside the lock - a full save just wrote every in-memory entry to
+        # disk, so anything the checkpoint journal was holding is now
+        # redundant. Clearing keeps it from growing unboundedly across runs.
+        from translation import checkpoint_journal
+        checkpoint_journal.clear()
+
         return self._project_file
 
     def load(self, path: str) -> None:
