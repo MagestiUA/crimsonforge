@@ -119,7 +119,7 @@ class TranslateTab(QWidget):
         self._target_combo = QComboBox()
         self._target_combo.setToolTip(
             "Select the language you are translating into.\n"
-            "This determines the AI prompt language and the output paloc file."
+            "This determines the AI prompt language."
         )
         all_langs = self._lang_config.get_all_languages()
         for lang in all_langs:
@@ -127,6 +127,27 @@ class TranslateTab(QWidget):
         self._target_combo.currentIndexChanged.connect(self._on_target_lang_changed)
         dst_layout.addWidget(self._target_combo)
         lang_row.addWidget(dst_group)
+
+        patch_group = QGroupBox("Patch Target (game file)")
+        patch_layout = QVBoxLayout(patch_group)
+        self._patch_target_combo = QComboBox()
+        self._patch_target_combo.setToolTip(
+            "Which game localization file actually receives the translated "
+            "text on 'Patch to Game'.\n"
+            "Defaults to whichever discovered language file matches your "
+            "Destination Language above. If the game has no native file for "
+            "that language (e.g. Ukrainian isn't a shipped language), pick "
+            "an existing language slot to carry the translation instead - "
+            "the source language file is never modified this way, so "
+            "change-detection against it stays reliable."
+        )
+        self._patch_target_combo.currentIndexChanged.connect(self._on_patch_target_changed)
+        patch_layout.addWidget(self._patch_target_combo)
+        self._patch_target_info = QLabel("No game loaded")
+        self._patch_target_info.setToolTip("The game file 'Patch to Game' will actually write into.")
+        self._patch_target_info.setStyleSheet("font-size: 11px; color: #a6adc8;")
+        patch_layout.addWidget(self._patch_target_info)
+        lang_row.addWidget(patch_group)
 
         ai_group = QGroupBox("AI Provider")
         ai_layout = QVBoxLayout(ai_group)
@@ -527,6 +548,8 @@ class TranslateTab(QWidget):
                 paloc_info,
             )
 
+        self._populate_patch_target_combo()
+
         count = len(self._discovered_palocs)
         build_info = self._get_game_build_info()
         if build_info["short_label"]:
@@ -551,9 +574,10 @@ class TranslateTab(QWidget):
         newly-added language (e.g. Steam released Indonesian) is
         visible after reload without a full app restart.
         """
-        # Capture the current source selection so we can try to
-        # restore it after the combo rebuild.
+        # Capture the current source/patch-target selections so we can try
+        # to restore them after the combo rebuild.
         prev_source_data = self._source_combo.currentData()
+        prev_patch_target_data = self._patch_target_combo.currentData()
 
         self._vfs = payload.vfs
         self._usage_index = LocalizationUsageIndex(self._vfs)
@@ -587,6 +611,8 @@ class TranslateTab(QWidget):
         if restore_index >= 0:
             self._source_combo.setCurrentIndex(restore_index)
         del blocker
+
+        self._populate_patch_target_combo(preferred_data=prev_patch_target_data)
 
         count = len(self._discovered_palocs)
         build_info = self._get_game_build_info()
@@ -716,12 +742,15 @@ class TranslateTab(QWidget):
 
     def _serialize_ui_state(self) -> dict:
         build_info = self._get_game_build_info()
+        patch_target = self._patch_target_combo.currentData()
         return {
             "source_lang": self._project.source_lang,
             "target_lang": self._project.target_lang,
             "source_file": self._project.source_file,
             "source_combo_text": self._source_combo.currentText(),
             "target_combo_index": self._target_combo.currentIndex(),
+            "patch_target_lang_code": patch_target.get("lang_code", "") if patch_target else "",
+            "patch_target_filename": patch_target.get("filename", "") if patch_target else "",
             "provider_id": self._provider_combo.currentData() or "",
             "game_build_id": build_info.get("build_id", ""),
             "game_build_display": build_info.get("build_display", ""),
@@ -744,6 +773,62 @@ class TranslateTab(QWidget):
             self._paloc_info.setText(
                 f"Group: {paloc_info['group']} | File: {paloc_info['filename']}"
             )
+
+    def _populate_patch_target_combo(self, preferred_data: dict | None = None) -> None:
+        """Fill the Patch Target combo from discovered game languages.
+
+        Defaults to whichever discovered file matches the current
+        Destination Language code (the common case: the game already
+        ships that language, so translating into it and patching it back
+        is the same file, same as before this combo existed). Falls back
+        to a previously selected file (matched by lang_code + filename) if
+        given and still present after a reload. Leaves nothing selected
+        when neither applies - the game has no native file for the target
+        language (e.g. Ukrainian), so which existing language slot should
+        carry the translation is a conscious choice, not a silent default
+        (silently defaulting to the source file is exactly the bug this
+        combo exists to prevent - it would make the "English never gets
+        modified so change-detection is reliable" guarantee false again).
+        """
+        blocker = QSignalBlocker(self._patch_target_combo)
+        self._patch_target_combo.clear()
+        self._patch_target_combo.addItem("(select a game file to patch)", None)
+
+        target_code = self._target_combo.currentData() or self._project.target_lang
+        default_index = 0
+        preferred_index = -1
+        for i, paloc_info in enumerate(self._discovered_palocs):
+            lang_code = paloc_info["lang_code"]
+            lang = self._lang_config.get_language(lang_code)
+            display_name = lang.name if lang else lang_code
+            self._patch_target_combo.addItem(
+                f"{display_name} ({paloc_info['filename']})",
+                paloc_info,
+            )
+            combo_index = i + 1  # offset by the placeholder item at index 0
+            if lang_code == target_code:
+                default_index = combo_index
+            if (
+                preferred_data
+                and paloc_info.get("lang_code") == preferred_data.get("lang_code")
+                and paloc_info.get("filename") == preferred_data.get("filename")
+            ):
+                preferred_index = combo_index
+
+        self._patch_target_combo.setCurrentIndex(
+            preferred_index if preferred_index >= 0 else default_index
+        )
+        del blocker
+        self._on_patch_target_changed()
+
+    def _on_patch_target_changed(self):
+        paloc_info = self._patch_target_combo.currentData()
+        if paloc_info:
+            self._patch_target_info.setText(
+                f"Group: {paloc_info['group']} | File: {paloc_info['filename']}"
+            )
+        else:
+            self._patch_target_info.setText("No file selected - required before Patch to Game")
 
     def _load_selected_paloc(self):
         """Load paloc from game, merging with any saved translations.
@@ -1331,9 +1416,18 @@ class TranslateTab(QWidget):
 
     def _patch_to_game(self):
         """Full pipeline: export, compress, encrypt, write PAZ, checksum chain, done."""
-        paloc_info = self._source_combo.currentData()
-        if not paloc_info:
+        source_paloc_info = self._source_combo.currentData()
+        patch_paloc_info = self._patch_target_combo.currentData()
+        if not source_paloc_info:
             show_error(self, "Error", "No source language selected.")
+            return
+        if not patch_paloc_info:
+            show_error(
+                self, "Error",
+                "No Patch Target selected. Pick which game language file "
+                "should receive the translated text (see 'Patch Target' "
+                "above the table)."
+            )
             return
         if not self._project.entries:
             show_error(self, "Error", "No translation data loaded.")
@@ -1370,12 +1464,26 @@ class TranslateTab(QWidget):
                 f"auto-filled from already-translated entries.\n"
             )
 
+        source_same_as_target = (
+            source_paloc_info["group"] == patch_paloc_info["group"]
+            and source_paloc_info["filename"] == patch_paloc_info["filename"]
+        )
+        overwrite_warning = ""
+        if source_same_as_target:
+            overwrite_warning = (
+                "\n⚠️  Patch Target is the SAME file the source text was "
+                "read from - this file will no longer read as pristine source "
+                "text after patching. Future 'has the source changed' checks "
+                "against it will be unreliable.\n"
+            )
+
         if not confirm_action(
             self, "Patch to Game",
-            f"Source:  {paloc_info['filename']}\n"
-            f"Package: {paloc_info['group']}\n"
+            f"Source:       {source_paloc_info['filename']} (read-only)\n"
+            f"Patch into:   {patch_paloc_info['filename']}\n"
+            f"Package:      {patch_paloc_info['group']}\n"
             f"Strings: {translated_count:,} / {total_count:,} translated\n"
-            f"{dup_line}\n"
+            f"{dup_line}{overwrite_warning}\n"
             f"A backup will be created before any game files are modified.\n\n"
             f"Proceed?"
         ):
@@ -1414,8 +1522,8 @@ class TranslateTab(QWidget):
 
             translation_result = patch_translation_to_game(
                 packages_path=str(self._packages_path),
-                group=paloc_info["group"],
-                filename=paloc_info["filename"],
+                group=patch_paloc_info["group"],
+                filename=patch_paloc_info["filename"],
                 replacements_by_key=replacements_by_key,
                 create_backup=True,
                 progress_callback=step,
@@ -1926,6 +2034,14 @@ class TranslateTab(QWidget):
             elif target_idx >= 0 and target_idx < self._target_combo.count():
                 self._target_combo.setCurrentIndex(target_idx)
 
+            patch_target_lang_code = ui_state.get("patch_target_lang_code", "")
+            patch_target_filename = ui_state.get("patch_target_filename", "")
+            if patch_target_lang_code or patch_target_filename:
+                self._populate_patch_target_combo(preferred_data={
+                    "lang_code": patch_target_lang_code,
+                    "filename": patch_target_filename,
+                })
+
             provider_id = ui_state.get("provider_id", "")
             if provider_id:
                 for i in range(self._provider_combo.count()):
@@ -2220,9 +2336,25 @@ class TranslateTab(QWidget):
                         old_preview = entry.original_text[:60]
                         new_preview = fresh_text[:60]
                         result["changed_samples"].append((entry.key, old_preview, new_preview))
+                    old_original = entry.original_text
+                    old_translation = entry.translated_text
                     entry.original_text = fresh_text
-                    if entry.translated_text and entry.status != StringStatus.PENDING:
-                        entry.status = StringStatus.TRANSLATED  # needs re-review
+                    if not entry.locked:
+                        if old_translation:
+                            stale_note = (
+                                f"[Source changed from {old_original!r} - previous "
+                                f"translation kept for reference: {old_translation!r}]"
+                            )
+                            entry.notes = (
+                                f"{entry.notes}\n{stale_note}".strip()
+                                if entry.notes else stale_note
+                            )
+                        # Reset for re-translation rather than leaving the
+                        # stale text under a "needs re-review" label a human
+                        # has to notice - the next Auto-Translate-All run
+                        # picks this back up automatically since it only
+                        # processes PENDING entries.
+                        entry.revert_to_pending()
                     if current_build_id:
                         entry.record_game_event(current_build_id, "changed")
                     result["changed"] += 1
