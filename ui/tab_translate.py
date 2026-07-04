@@ -1088,6 +1088,50 @@ class TranslateTab(QWidget):
         except Exception as e:
             show_error(self, "Save Error", str(e))
 
+    def _build_reference_language_maps(self) -> list[tuple[str, str, dict[str, str]]]:
+        """Build cross-reference maps (key -> text) for languages that help
+        the AI disambiguate meaning or grammar beyond the source text alone.
+
+        Only kicks in for a Ukrainian target: Korean (the game's original
+        source language, before any translation) helps when the English
+        source text itself is ambiguous; Russian (grammatically close to
+        Ukrainian) helps pick the correct gender/case/number when English
+        doesn't mark them at all. Silently returns an empty list if the
+        game or the reference languages aren't available - this is a
+        quality enhancement, not a requirement for translation to work.
+        """
+        if self._project.target_lang != "uk" or not self._vfs:
+            return []
+
+        wanted = [("kor", "Korean", "original"), ("rus", "Russian", "grammar")]
+        references: list[tuple[str, str, dict[str, str]]] = []
+        for lang_key, label, purpose in wanted:
+            paloc_info = next(
+                (p for p in self._discovered_palocs if p.get("lang_key") == lang_key), None,
+            )
+            if not paloc_info:
+                continue
+            try:
+                pamt_data = self._vfs.load_pamt(paloc_info["group"])
+                fresh_entry = next(
+                    (fe for fe in pamt_data.file_entries
+                     if fe.path.lower().endswith(paloc_info["filename"].lower())),
+                    None,
+                )
+                if not fresh_entry:
+                    continue
+                from core.paloc_parser import parse_paloc
+                raw = self._vfs.read_entry_data(fresh_entry)
+                key_to_text = {
+                    e.key: e.value for e in parse_paloc(raw)
+                    if not e.key.startswith(("@", "#"))
+                }
+                references.append((label, purpose, key_to_text))
+                logger.info("Loaded %s reference translations for cross-language context", lang_key)
+            except Exception as ex:
+                logger.warning("Could not load %s reference translations: %s", lang_key, ex)
+        return references
+
     def _auto_translate_all(self):
         provider, model, error = self._get_ai_provider_and_model()
         if not provider:
@@ -1104,7 +1148,8 @@ class TranslateTab(QWidget):
             batch_delay_ms=self._config.get("translation.batch_delay_ms", 500),
         )
         engine.set_glossary(self._get_glossary_prompt())
-        self._batch_processor = TranslationBatchProcessor(engine, self._project)
+        reference_languages = self._build_reference_language_maps()
+        self._batch_processor = TranslationBatchProcessor(engine, self._project, reference_languages)
 
         self._auto_translate_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)

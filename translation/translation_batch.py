@@ -18,9 +18,43 @@ logger = get_logger("translation.batch")
 class TranslationBatchProcessor:
     """Processes batch translations, updating project entries with results."""
 
-    def __init__(self, engine: TranslationEngine, project: TranslationProject):
+    def __init__(
+        self,
+        engine: TranslationEngine,
+        project: TranslationProject,
+        reference_languages: Optional[list[tuple[str, str, dict[str, str]]]] = None,
+    ):
+        """
+        Args:
+            reference_languages: Optional list of (display_label, purpose,
+                key_to_text) tuples used to give the AI extra per-line
+                context beyond the source text alone. purpose is either
+                "original" (this language is the game's original source,
+                e.g. Korean - helps resolve ambiguity in the source text
+                CrimsonForge translates from) or "grammar" (a language
+                related to the target that already made gender/case/number
+                choices for this line, e.g. Russian for a Ukrainian target -
+                helps when the source language doesn't mark them at all).
+                key_to_text maps a paloc key to that language's text for
+                the same line.
+        """
         self._engine = engine
         self._project = project
+        self._reference_languages = reference_languages or []
+
+    def _build_context(self, key: str) -> str:
+        if not self._reference_languages:
+            return ""
+        parts = []
+        for label, purpose, key_to_text in self._reference_languages:
+            text = key_to_text.get(key)
+            if not text:
+                continue
+            if purpose == "original":
+                parts.append(f"{label} (original source language): {text}")
+            elif purpose == "grammar":
+                parts.append(f"{label} (for grammatical agreement only): {text}")
+        return "\n".join(parts)
 
     def _dedup_and_translate(
         self,
@@ -42,7 +76,10 @@ class TranslationBatchProcessor:
 
         unique_texts = list(groups.keys())
         requests = [
-            TranslationRequest(index=i, text=text, key=groups[text][0].key)
+            TranslationRequest(
+                index=i, text=text, key=groups[text][0].key,
+                context=self._build_context(groups[text][0].key),
+            )
             for i, text in enumerate(unique_texts)
         ]
 

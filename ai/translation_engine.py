@@ -39,6 +39,24 @@ BATCH_JSON_INSTRUCTION = (
     'nothing before or after the object.'
 )
 
+# Appended to the batch prompt only when at least one item in the chunk
+# actually carries a "context" field - cross-referencing another shipped
+# translation of the SAME line to disambiguate meaning or grammar the
+# source language alone can't express (e.g. English doesn't mark
+# grammatical gender, so a Slavic reference translation resolves it).
+CROSS_REFERENCE_INSTRUCTION = (
+    'Some items include an optional "context" field with reference '
+    'translations of that SAME line in other languages, for disambiguation '
+    'only - always translate from the item\'s "text" field, never from the '
+    'context field. A reference labeled as the original source language '
+    'shows the game\'s original text before any translation - use it when '
+    '"text" seems ambiguous or context-dependent. A reference labeled '
+    '"for grammatical agreement only" is in a language related to the '
+    'target language - use it only to pick the correct grammatical gender, '
+    'case, or number in your translation when the source text doesn\'t '
+    'mark them; never copy its wording, vocabulary, or phrasing.'
+)
+
 # Conservative per-chunk token budget so a run of unusually long strings
 # can't blow past the fast context buckets (see ai/provider_ollama.py).
 # Measured on the live game data: median string ~7 tokens, p99 ~90 tokens,
@@ -309,17 +327,26 @@ class TranslationEngine:
             )
 
         encoded_items = [encode_for_translation(req.text) for req in chunk_requests]
-        payload = json.dumps(
-            {"items": [{"id": i, "text": encoded_items[i][0]} for i in range(len(chunk_requests))]},
-            ensure_ascii=False,
-        )
+        items_payload = []
+        has_context = False
+        for i, req in enumerate(chunk_requests):
+            item = {"id": i, "text": encoded_items[i][0]}
+            if req.context:
+                item["context"] = req.context
+                has_context = True
+            items_payload.append(item)
+        payload = json.dumps({"items": items_payload}, ensure_ascii=False)
+
+        effective_batch_prompt = batch_system_prompt
+        if has_context:
+            effective_batch_prompt = batch_system_prompt + "\n\n" + CROSS_REFERENCE_INSTRUCTION
 
         batch_result = self._provider.translate(
             text=payload,
             source_lang=source_lang,
             target_lang=target_lang,
             model=model,
-            system_prompt=batch_system_prompt,
+            system_prompt=effective_batch_prompt,
             context="",
         )
 
