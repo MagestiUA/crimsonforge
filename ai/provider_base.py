@@ -147,3 +147,23 @@ class AIProviderBase(ABC):
             self._timeout = timeout
         if max_retries > 0:
             self._max_retries = max_retries
+
+    def prepare_for_batch(self, sample_texts: list[str], system_prompt: str = "") -> None:
+        """Optional hook called once before a batch translation run starts.
+
+        Lets a provider tune per-session parameters ahead of time (e.g. an
+        Ollama context window sized for this batch's longest string) instead
+        of per-request, which would be expensive for providers that reload
+        state on parameter changes. No-op by default.
+        """
+        pass
+
+    def ensure_ready(self) -> None:
+        """Optional hook called when resuming a paused batch.
+
+        A pause can last hours (overnight, waiting on the user) - long enough
+        for a local backend to have gone away in the meantime. Lets a
+        provider re-verify/restart its backend before more requests are sent.
+        No-op by default (only matters for local providers like Ollama).
+        """
+        pass
