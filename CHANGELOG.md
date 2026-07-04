@@ -7,6 +7,67 @@ This file tracks changes made in this fork on top of upstream
 full historical changelog for the base project (every version back to
 1.0) lives in `version.py` and is rendered in the app's **About** tab.
 
+## v1.29.0 — 2026-07-05
+
+### Parallel translation for high-concurrency providers
+
+- **New "Parallel Workers" setting** (Settings → Translation, 1-100,
+  default 1) splits Auto-Translate-All across N concurrent lanes, each
+  with its own cloned provider instance and no artificial pacing
+  between lanes. Meant for providers whose rate limiting is dynamic/
+  load-based with a generous concurrency ceiling rather than a hard
+  per-minute quota - DeepSeek is the motivating case: limits are
+  per-account (not per-key - multiple API keys don't multiply
+  capacity) and load-based, with a documented concurrency ceiling in
+  the hundreds-to-thousands depending on model.
+- An earlier version of this built for Gemini's free tier needed a
+  strict per-lane pacing scheduler to survive its hard RPM cap, and was
+  fully reverted after live testing showed it still broke down under
+  load anyway. This version has none of that scheduling complexity -
+  each lane just runs as fast as it can and relies on the provider's
+  own existing 429/5xx retry handling.
+- **Real numbers from a live run:** 50 concurrent lanes against
+  DeepSeek translated several thousand pending strings (out of a
+  187,526-entry project) in under 10 minutes. Total DeepSeek spend for
+  the entire day's testing plus the full production translation run:
+  **~$1**.
+- **Stop is responsive even with many lanes in flight.** A lane stuck
+  in a 429/5xx retry backoff now wakes up immediately instead of
+  blocking Stop for up to 30 seconds per lane. Verified live: stopping
+  mid-run with 5 active lanes returned in ~3.6s (bounded only by
+  already-in-flight HTTP requests finishing, which can't be cancelled
+  mid-request).
+
+### Translation quality
+
+- **Cross-language reference context for Ukrainian targets.** English
+  alone doesn't mark grammatical gender/case/number - a documented
+  weakness in at least one existing community Ukrainian translation
+  for this game. When the target language is Ukrainian,
+  Auto-Translate-All now reads the game's Korean (original source
+  language) and Russian (grammatically close to Ukrainian) text for
+  the same line and passes both into the AI prompt as
+  disambiguation-only reference: translate from the English source,
+  consult Korean when the English text itself seems ambiguous, use
+  Russian only to pick correct grammatical agreement - never copy its
+  wording. Silently skipped if the game or those languages aren't
+  available.
+
+### Data quality tooling
+
+- **New `tools/flag_latin_leak_entries.py`** - finds entries marked
+  translated whose translation still contains unprotected Latin-script
+  text (names left untranslated before the transliteration prompt fix,
+  or a rare batch response that echoed source text back unchanged) and
+  requeues them to PENDING with the old translation kept in notes.
+  Correctly ignores protected placeholder tokens (including their own
+  sentinel spelling, which contains Latin letters) and Roman numerals
+  (a legitimate convention for item/blueprint tiers). Verified against
+  a real 187k-entry project: an initial naive version flagged 22,291
+  entries, almost entirely false positives from the sentinel format
+  itself; the corrected version flags 5,625, predominantly genuine
+  leaked names on manual review.
+
 ## v1.28.0 — 2026-07-04
 
 ### Storage

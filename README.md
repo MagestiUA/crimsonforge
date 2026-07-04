@@ -68,7 +68,9 @@ If you're looking for the original project and its full reverse-engineering hist
 - AI batch translation with multiple providers
 - JSON-array batch requests (many strings per call) with automatic bisection retry when a batch response can't be trusted
 - Duplicate-aware translation — identical source strings are translated once and stamped across every occurrence
-- Automatic 429/5xx handling per provider (rate-limit cooldown vs transient-error retry, tuned separately)
+- Optional parallel translation (1-100 concurrent lanes) for providers with a generous, load-based concurrency ceiling instead of a hard per-minute quota — e.g. 50 lanes against DeepSeek translated several thousand strings in under 10 minutes for about $1 total
+- Automatic 429/5xx handling per provider (rate-limit cooldown vs transient-error retry, tuned separately), with a Stop button that stays responsive even mid-retry across many concurrent lanes
+- Cross-language reference context for Ukrainian targets — consults the game's Korean (original) and Russian (grammatically close) text for the same line to help the AI disambiguate meaning and pick correct grammatical gender/case, without copying either language's wording
 - Prompt system designed to preserve placeholders, tags, and game terminology; transliterates names into the target script when it differs from the source
 - Independent Patch Target selection — translate from one game language and patch the result into a different one (useful when the game has no native file for your target language)
 - Glossary support
