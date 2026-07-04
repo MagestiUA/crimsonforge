@@ -30,7 +30,6 @@ from core.papgt_manager import (
     update_papgt_pamt_crc, update_papgt_self_crc,
 )
 from core.backup_manager import BackupManager
-from translation import checkpoint_journal
 from translation.language_config import LanguageConfig
 from translation.translation_state import TranslationEntry, StringStatus
 from translation.translation_project import TranslationProject
@@ -812,7 +811,6 @@ class TranslateTab(QWidget):
                 try:
                     candidate = TranslationProject()
                     candidate.load(recovery_path)
-                    checkpoint_journal.merge_into(candidate)
                     if candidate.source_file == filename:
                         saved_project = candidate
                         logger.info(
@@ -967,7 +965,6 @@ class TranslateTab(QWidget):
         try:
             self._project = TranslationProject()
             self._project.load(path)
-            checkpoint_journal.merge_into(self._project)
             merge = self._merge_with_fresh_game_data()
             self._apply_usage_tags(rebuild=True)
             self._reload_table()
@@ -1899,7 +1896,6 @@ class TranslateTab(QWidget):
         try:
             self._project = TranslationProject()
             self._project.load(recovery_path)
-            checkpoint_journal.merge_into(self._project)
 
             ui_state = {}
             if os.path.isfile(ui_path):

@@ -8,7 +8,6 @@ from typing import Optional, Callable
 
 from ai.translation_engine import TranslationEngine, TranslationRequest, BatchState
 from ai.provider_base import TranslationResult
-from translation import checkpoint_journal
 from translation.translation_state import TranslationEntry, StringStatus
 from translation.translation_project import TranslationProject
 from utils.logger import get_logger
@@ -65,7 +64,7 @@ class TranslationBatchProcessor:
                         tokens=result.total_tokens,
                         cost=result.cost_estimate,
                     )
-                    checkpoint_journal.record(entry)
+                    self._project.persist_entry(entry)
                 self._project.mark_modified()
             resolved += len(group)
             if progress_callback:

@@ -1,11 +1,14 @@
 """Translation project manager - load, save, and manage translation projects.
 
-A translation project is a JSON file that stores all translation entries,
-their states, and metadata. Projects can be saved and reopened later.
+A translation project is a SQLite-backed file that stores all translation
+entries, their states, and metadata. Projects can be saved and reopened
+later. Legacy single-JSON-file projects (pre-1.28) are migrated to SQLite
+in place, transparently, the first time they're loaded.
 """
 
 import json
 import os
+import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -97,7 +100,7 @@ class TranslationProject:
         logger.info("Created project: %d entries, %s -> %s", len(self._entries), source_lang, target_lang)
 
     def save(self, path: str = "") -> str:
-        """Save the project to a JSON file.
+        """Save the project to its SQLite-backed file.
 
         Args:
             path: File path to save to. Uses existing path if empty.
@@ -115,70 +118,101 @@ class TranslationProject:
 
             self._updated_at = datetime.now().isoformat()
 
-            data = {
-                "version": "1.0.0",
+            meta = {
                 "source_lang": self._source_lang,
                 "target_lang": self._target_lang,
                 "source_file": self._source_file,
                 "game_build_id": self._game_build_id,
                 "game_build_display": self._game_build_display,
                 "game_fingerprint": self._game_fingerprint,
-                "update_history": self._update_history,
-                "last_sync_summary": self._last_sync_summary,
                 "created_at": self._created_at,
                 "updated_at": self._updated_at,
-                "entry_count": len(self._entries),
-                "stats": self._compute_stats(),
-                "entries": [e.to_dict() for e in self._entries],
+                "update_history": self._update_history,
+                "last_sync_summary": self._last_sync_summary,
             }
 
-            Path(self._project_file).parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._project_file + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, self._project_file)
+            from translation import translation_db
+            translation_db.save_all(self._project_file, meta, self._entries)
 
             self._modified = False
-            logger.info("Project saved: %s", self._project_file)
-
-        # Outside the lock - a full save just wrote every in-memory entry to
-        # disk, so anything the checkpoint journal was holding is now
-        # redundant. Clearing keeps it from growing unboundedly across runs.
-        from translation import checkpoint_journal
-        checkpoint_journal.clear()
 
         return self._project_file
 
     def load(self, path: str) -> None:
-        """Load a project from a JSON file."""
+        """Load a project, migrating a legacy JSON file to SQLite in place
+        the first time it's opened."""
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"Project file not found: {path}. "
                 f"Check that the file exists and has not been moved."
             )
 
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        from translation import translation_db
 
-        self._source_lang = data["source_lang"]
-        self._target_lang = data["target_lang"]
-        self._source_file = data.get("source_file", "")
-        self._game_build_id = data.get("game_build_id", "")
-        self._game_build_display = data.get("game_build_display", self._game_build_id)
-        self._game_fingerprint = data.get("game_fingerprint", "")
-        self._update_history = list(data.get("update_history", []))
-        self._last_sync_summary = dict(data.get("last_sync_summary", {}))
-        self._created_at = data.get("created_at", "")
-        self._updated_at = data.get("updated_at", "")
+        if translation_db.is_sqlite_file(path):
+            meta, self._entries = translation_db.load_all(path)
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._entries = [
+                TranslationEntry.from_dict(d) for d in data.get("entries", [])
+            ]
+            meta = {
+                "source_lang": data.get("source_lang", ""),
+                "target_lang": data.get("target_lang", ""),
+                "source_file": data.get("source_file", ""),
+                "game_build_id": data.get("game_build_id", ""),
+                "game_build_display": data.get("game_build_display", ""),
+                "game_fingerprint": data.get("game_fingerprint", ""),
+                "created_at": data.get("created_at", ""),
+                "updated_at": data.get("updated_at", ""),
+                "update_history": data.get("update_history", []),
+                "last_sync_summary": data.get("last_sync_summary", {}),
+            }
+            # Keep the original JSON as a backup and build the new SQLite
+            # file at a temp path first - the on-disk project is never left
+            # in a half-migrated state if this fails partway.
+            backup_path = path + ".legacy-json-backup"
+            if not os.path.exists(backup_path):
+                shutil.copy2(path, backup_path)
+            tmp_db_path = path + ".migrating.tmp"
+            if os.path.exists(tmp_db_path):
+                os.remove(tmp_db_path)
+            translation_db.save_all(tmp_db_path, meta, self._entries)
+            os.replace(tmp_db_path, path)
+            logger.info(
+                "Migrated legacy JSON project to SQLite in place: %s (backup: %s)",
+                path, backup_path,
+            )
+
+        self._source_lang = meta.get("source_lang", "")
+        self._target_lang = meta.get("target_lang", "")
+        self._source_file = meta.get("source_file", "")
+        self._game_build_id = meta.get("game_build_id", "")
+        self._game_build_display = meta.get("game_build_display", self._game_build_id)
+        self._game_fingerprint = meta.get("game_fingerprint", "")
+        self._update_history = list(meta.get("update_history", []))
+        self._last_sync_summary = dict(meta.get("last_sync_summary", {}))
+        self._created_at = meta.get("created_at", "")
+        self._updated_at = meta.get("updated_at", "")
         self._project_file = path
-
-        self._entries = []
-        for entry_data in data.get("entries", []):
-            self._entries.append(TranslationEntry.from_dict(entry_data))
 
         self._modified = False
         self._rebuild_index_map()
         logger.info("Project loaded: %s (%d entries)", path, len(self._entries))
+
+    def persist_entry(self, entry: TranslationEntry) -> None:
+        """Immediately persist a single entry's current state to disk.
+
+        Used during a running translation batch so completed work survives
+        a crash without waiting for the next full save() - a single SQLite
+        row upsert, independent of overall project size. No-op until the
+        project has been saved at least once (no path to write to yet).
+        """
+        if not self._project_file:
+            return
+        from translation import translation_db
+        translation_db.upsert_entry(self._project_file, entry)
 
     def _compute_stats(self) -> dict:
         stats = {s.value: 0 for s in StringStatus}
