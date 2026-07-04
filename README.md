@@ -1,5 +1,7 @@
 # CrimsonForge
 
+🇬🇧 English | [🇺🇦 Українська](README.uk.md)
+
 CrimsonForge is a complete modding studio for **Crimson Desert**.
 
 It lets you browse game archives, translate localization with AI, inspect and replace meshes, replace audio, generate dialogue voices, patch fonts, and write everything back with valid checksums so the game still launches normally.
@@ -9,6 +11,8 @@ CrimsonForge handles the full pipeline:
 `decrypt (ChaCha20) -> decompress (LZ4) -> parse -> modify -> recompress -> re-encrypt -> update PAMT -> update PAPGT -> ready to play`
 
 ## Current Release
+
+See [CHANGELOG.md](CHANGELOG.md) for this fork's changes, or the in-app **About** tab / `version.py` for the full upstream history.
 
 **Latest version:** `1.11.0`
 
@@ -57,6 +61,10 @@ Recent highlights:
 
 - Parse and work with more than **172,000** localization entries
 - AI batch translation with multiple providers
+- JSON-array batch requests (many strings per call) with automatic bisection retry when a batch response can't be trusted
+- Duplicate-aware translation — identical source strings are translated once and stamped across every occurrence
+- Crash-safe checkpoint journal so an interrupted run never loses already-translated entries
+- Automatic 429/5xx handling per provider (rate-limit cooldown vs transient-error retry, tuned separately)
 - Prompt system designed to preserve placeholders, tags, and game terminology
 - Glossary support
 - Autosave and session recovery
