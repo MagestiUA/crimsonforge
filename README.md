@@ -60,15 +60,16 @@ Recent highlights:
 ### Translation Workspace
 
 - Parse and work with more than **172,000** localization entries
+- SQLite-backed project storage — fast full saves, crash-safe incremental writes during a batch, automatic migration from older JSON projects
 - AI batch translation with multiple providers
 - JSON-array batch requests (many strings per call) with automatic bisection retry when a batch response can't be trusted
 - Duplicate-aware translation — identical source strings are translated once and stamped across every occurrence
-- Crash-safe checkpoint journal so an interrupted run never loses already-translated entries
 - Automatic 429/5xx handling per provider (rate-limit cooldown vs transient-error retry, tuned separately)
-- Prompt system designed to preserve placeholders, tags, and game terminology
+- Prompt system designed to preserve placeholders, tags, and game terminology; transliterates names into the target script when it differs from the source
+- Independent Patch Target selection — translate from one game language and patch the result into a different one (useful when the game has no native file for your target language)
 - Glossary support
 - Autosave and session recovery
-- Game update detection and merge behavior for changed localization data
+- Game update detection and merge behavior for changed localization data, including auto-requeueing entries whose source text changed
 
 ### Font Builder
 

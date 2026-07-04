@@ -7,6 +7,64 @@ This file tracks changes made in this fork on top of upstream
 full historical changelog for the base project (every version back to
 1.0) lives in `version.py` and is rendered in the app's **About** tab.
 
+## v1.28.0 — 2026-07-04
+
+### Storage
+
+- **SQLite replaces the single-JSON-file project format.** Full save of
+  a 187k-entry project drops from ~4.17s to ~1.5s, and the file itself
+  shrinks (a real 187k-entry project went from 245MB to 135MB).
+  `TranslationProject.persist_entry()` upserts a single row directly
+  into the same file during a running batch, so the separate
+  `checkpoint_journal.db` from v1.27.0 is no longer needed and has been
+  removed - its whole reason to exist (surviving a crash between
+  expensive full JSON rewrites) is now solved at the source.
+- **Legacy JSON projects migrate automatically and safely.**
+  `TranslationProject.load()` detects a pre-1.28 JSON project by
+  sniffing for the SQLite magic header, copies it to a
+  `.legacy-json-backup` sidecar, builds the new SQLite file at a temp
+  path, and atomically swaps it in - an interrupted migration can never
+  leave a project file that's neither valid JSON nor valid SQLite.
+
+### Patch target and change detection
+
+- **New "Patch Target (game file)" selector**, independent of Source
+  Language. Previously "Patch to Game" always wrote translated text
+  back into the same file it read as source - which makes that file
+  useless as a future comparison baseline the moment it's patched once,
+  since a later sync could read its own prior output back as if it
+  were new source text. The selector defaults to whichever discovered
+  file matches Destination Language, and leaves nothing preselected
+  when the game has no native file for the target language, forcing an
+  explicit choice of which existing slot carries the translation
+  (mirroring the "Game Language to Replace" picker already used for
+  packaged mod exports).
+- **Source-text changes now auto-requeue for translation.** An entry
+  whose source text changed is reset straight to PENDING (the previous
+  translation is stashed in `notes` for reference) instead of being
+  left TRANSLATED under an implicit "needs re-review" label - the next
+  Auto-Translate-All run picks it up automatically. Locked entries
+  (auto-approved placeholders) are left untouched.
+- **Character/place names are now transliterated for script-mismatched
+  languages** (e.g. Latin -> Cyrillic) instead of being left
+  untranslated in the source script, which read as a bug rather than a
+  deliberate choice. Same-script language pairs keep the previous
+  behavior.
+
+### Data repair
+
+- **New `tools/repair_corrupted_original_text.py`** for projects hit by
+  a pre-1.28 bug: once a source file had been patched, a later sync
+  could read that patched file back as fresh source text and silently
+  overwrite `original_text` with the entry's own prior translation.
+  The tool repairs affected entries against the untouched
+  `BaselineManager` record (which only ever records a key's value once
+  and never overwrites it), touching only `original_text` - existing
+  translations and statuses are never discarded or needlessly
+  re-queued. Verified against a real 187k-entry project: 150,387
+  entries (80%) had this corruption, all repaired cleanly with zero
+  ambiguous cases and zero translation/status changes.
+
 ## v1.27.0 — 2026-07-04
 
 ### Translation reliability
