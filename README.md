@@ -10,19 +10,23 @@ CrimsonForge handles the full pipeline:
 
 `decrypt (ChaCha20) -> decompress (LZ4) -> parse -> modify -> recompress -> re-encrypt -> update PAMT -> update PAPGT -> ready to play`
 
-## Current Release
+## About This Fork
 
-See [CHANGELOG.md](CHANGELOG.md) for this fork's changes, or the in-app **About** tab / `version.py` for the full upstream history.
+This is an actively maintained continuation of [hzeemr/crimsonforge](https://github.com/hzeemr/crimsonforge) — a genuinely excellent foundation built from scratch by the original author, including deep reverse-engineering of the PAC/PAB/PAA mesh and animation formats, the skeleton/rigging pipeline, and the full archive/checksum chain. Upstream development paused after `v1.26.0` (last commit 2026-05-12); this fork continues active work on top of it, starting with the translation pipeline.
 
-**Latest version:** `1.11.0`
+**What this fork adds on top of `v1.26.0`** (full detail in [CHANGELOG.md](CHANGELOG.md)):
 
-Recent highlights:
+- SQLite-backed translation project storage — faster full saves, crash-safe incremental writes during a batch, automatic migration from the old JSON format
+- Reliable AI batch translation: JSON-array batching with bisection retry on untrustworthy responses, per-provider 429/5xx handling tuned for real rate limits, duplicate-aware translation that roughly halves AI calls on typical localization data
+- Ollama quantization enforcement, so local translation actually runs at the speed it's configured for instead of silently falling back to an unquantized server
+- Independent Patch Target selection — translate from one game language and patch the result into a different one, so a language the game doesn't ship natively (e.g. Ukrainian) can still get a fully native-feeling in-game slot
+- Automatic re-queueing when the game's source text changes, instead of a stale translation silently sitting there
+- Script-aware name transliteration (e.g. Latin → Cyrillic) instead of leaving names untranslated in the wrong alphabet
+- A data-repair tool for projects affected by a historical source-text corruption bug
 
-- Full PAC round-trip editing now supports export, edit, add/delete geometry, re-import, and patch back to game for topology-changing meshes
-- Explorer can search by live in-game item names like `Vow of the Dead King`
-- Search history now persists across Explorer, Audio, and Translate
-- Explorer 3D preview uses a much faster hardware-accelerated OpenGL viewer
-- Bundled standalone builds now resolve runtime data correctly and include the full `data` directory
+If you're looking for the original project and its full reverse-engineering history, go to [hzeemr/crimsonforge](https://github.com/hzeemr/crimsonforge) — all of that foundational work is still there, and this fork wouldn't exist without it.
+
+**Current version:** `1.28.0` — see [CHANGELOG.md](CHANGELOG.md) for this fork's changes, or the in-app **About** tab / `version.py` for the full history back to `v1.0`.
 
 ## Main Features
 
