@@ -17,11 +17,18 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.29.0"
+APP_VERSION = "1.30.0"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.30.0", "2026-07-09", [
+            "[Ship to App] Fixed the Manager ZIP package (CDUMM/DMM/Vortex target): it was writing raw, unencrypted, unencoded paloc data under a `files/` prefix with no game-group folder, which no mod manager could actually apply. It now shares the same PAZ/PAMT/PAPGT repacking logic as the Standalone ZIP (extracted into `_build_patched_archive_files()`) and writes the patched archives directly under their numbered game-group folders at the ZIP root, matching CDUMM's documented 'Folders -> PAZ/PAMT files' format. Verified against a live DMM install after the fix.",
+            "[Ship to App] The bundled README.txt for Manager ZIP packages now documents the real Vortex -> DMM install flow (establish baseline, import, mount) plus a manual no-mod-manager install (copy the numbered folders straight into the game directory), in Ukrainian when the project's target language is Ukrainian.",
+            "[Ship to App] Fixed `generator_url` metadata and README credit links in shipped packages (both translation and mesh mods) pointing at the upstream repo instead of the fork that actually built them.",
+        ]
+    ),
     (
         "1.29.0", "2026-07-05", [
             "[Translation] New 'Parallel Workers' setting (Settings -> Translation, 1-100, default 1) splits Auto-Translate-All across N concurrent lanes, each with its own cloned provider instance and no artificial pacing between them - meant for providers with a generous, load-based concurrency ceiling rather than a hard per-minute quota. DeepSeek is the motivating case: rate limits are applied per-account (not per-key, so multiple API keys don't multiply capacity) and dynamically based on server load, with a documented concurrency ceiling in the hundreds-to-thousands depending on model. An earlier attempt at this for Gemini's free tier needed a strict per-lane pacing scheduler to survive its hard RPM cap and was fully reverted after live-testing showed the scheduler didn't fully prevent 500s under load anyway; this version is deliberately simpler and has none of that - each lane just runs as fast as it can and relies on the provider's own existing 429/5xx retry handling. Verified live: 50 concurrent lanes against DeepSeek translated several thousand pending strings in under 10 minutes total spend for the whole day's testing and production run was ~$1.",

@@ -156,8 +156,9 @@ class ShipToAppDialog(QDialog):
     def _refresh_package_mode_ui(self):
         if self._package_mode_key() == "manager":
             self._package_note.setText(
-                "Generates a much smaller ZIP with loose translated files under files/, "
-                "plus manifest.json and modinfo.json for CDUMM, Crimson Browser, and similar managers."
+                "Generates patched PAZ/PAMT/PAPGT files under numbered game-group folders "
+                "(e.g. 0022/), plus manifest.json and modinfo.json for CDUMM and similar "
+                "PAZ/PAMT-aware managers."
             )
             self._generate_btn.setText("Generate Manager ZIP")
         else:
@@ -265,7 +266,7 @@ class ShipToAppDialog(QDialog):
             size = os.path.getsize(save_path)
             size_str = f"{size / (1024 * 1024):.1f} MB" if size > 1024 * 1024 else f"{size / 1024:.0f} KB"
             msg = (
-                "Import this ZIP into CDUMM, Crimson Browser, or another loose-file aware mod manager."
+                "Import this ZIP into CDUMM or another Crimson Desert mod manager that supports PAZ/PAMT-format mods."
                 if self._package_mode_key() == "manager"
                 else "End user extracts ZIP and runs install.bat."
             )
@@ -345,17 +346,22 @@ class ShipToAppDialog(QDialog):
             "font_included": bool(self._built_font_data and self._built_font_info),
         }
 
-    def _build_standalone_zip(self, output_path):
+    def _build_patched_archive_files(self, ctx) -> dict[str, bytes]:
+        """Compress+encrypt the translated paloc (and font, if any) and splice
+        them into copies of the original PAZ archives.
+
+        Returns ``{relative_path: bytes}`` for every PAMT/PAZ/PAPGT file
+        that changed, keyed by the numbered game-group path (e.g.
+        ``0022/0.pamt``) - the same shape whether the caller writes these
+        under ``data/`` for an install.bat package or straight into a
+        mod-manager package root.
+        """
         from core.checksum_engine import pa_checksum
         from core.compression_engine import compress
         from core.crypto_engine import encrypt
         from core.pamt_parser import find_file_entry, parse_pamt, update_pamt_file_entry, update_pamt_paz_entry, update_pamt_self_crc
         from core.papgt_manager import get_pamt_crc_offset, parse_papgt, update_papgt_pamt_crc, update_papgt_self_crc
 
-        ctx = self._prepare_ctx()
-        self._status.setText("Compressing and encrypting paloc...")
-        self._progress.setValue(25)
-        QApplication.processEvents()
         paloc_entry = ctx["paloc_entry"]
         translated_paloc = ctx["translated_paloc"]
         comp = compress(translated_paloc, 2)
@@ -420,6 +426,14 @@ class ShipToAppDialog(QDialog):
                 patched[f"{fg}/0.pamt"] = bytes(fr)
                 patched[f"{fg}/{os.path.basename(fentry.paz_file)}"] = bytes(fpaz)
                 patched["meta/0.papgt"] = bytes(papgt_raw)
+        return patched
+
+    def _build_standalone_zip(self, output_path):
+        ctx = self._prepare_ctx()
+        self._status.setText("Compressing and encrypting paloc...")
+        self._progress.setValue(25)
+        QApplication.processEvents()
+        patched = self._build_patched_archive_files(ctx)
         self._status.setText("Writing ZIP...")
         self._progress.setValue(85)
         QApplication.processEvents()
@@ -434,18 +448,27 @@ class ShipToAppDialog(QDialog):
 
     def _build_manager_zip(self, output_path):
         ctx = self._prepare_ctx()
+        self._status.setText("Building patched PAZ...")
+        self._progress.setValue(25)
+        QApplication.processEvents()
+        patched = self._build_patched_archive_files(ctx)
         self._status.setText("Writing manager ZIP...")
         self._progress.setValue(75)
         QApplication.processEvents()
         created_utc = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-        files_meta = [
-            {"path": rel_path, "kind": "font" if rel_path == ctx["font_entry_path"] else "paloc"}
-            for rel_path in sorted(ctx["loose_files"].keys())
-        ]
+
+        def _kind(rel_path: str) -> str:
+            if rel_path.endswith(".pamt"):
+                return "pamt"
+            if rel_path.endswith(".papgt"):
+                return "papgt"
+            return "paz"
+
+        files_meta = [{"path": rel_path, "kind": _kind(rel_path)} for rel_path in sorted(patched.keys())]
         manifest = {
             "format": "v1",
             "schema_version": 1,
-            "kind": "translation_loose_mod",
+            "kind": "translation_paz_mod",
             "game": "Crimson Desert",
             "title": ctx["mod_name"],
             "name": ctx["mod_name"],
@@ -454,13 +477,12 @@ class ShipToAppDialog(QDialog):
             "version": ctx["version"],
             "created_utc": created_utc,
             "generator": "CrimsonForge",
-            "generator_url": "https://github.com/hzeemr/crimsonforge",
+            "generator_url": "https://github.com/MagestiUA/crimsonforge",
             "game_build": ctx["game_build"],
             "replace_language": {"code": ctx["replace_key"], "name": ctx["replace_name"]},
             "target_language": {"code": self._project.target_lang, "name": ctx["target_name"]},
             "translated_entry_count": ctx["replacement_count"],
-            "file_count": len(ctx["loose_files"]),
-            "files_root": "files",
+            "file_count": len(patched),
             "files": files_meta,
             "font_included": ctx["font_included"],
         }
@@ -471,16 +493,16 @@ class ShipToAppDialog(QDialog):
             "version": ctx["version"],
             "game": "Crimson Desert",
             "format": "v1",
-            "type": "translation_loose_mod",
+            "type": "translation_paz_mod",
             "description": f"Translation package for {ctx['target_name']} replacing {ctx['replace_name']}.",
             "generator": "CrimsonForge",
-            "generator_url": "https://github.com/hzeemr/crimsonforge",
+            "generator_url": "https://github.com/MagestiUA/crimsonforge",
             "game_build": ctx["game_build"],
             "created_utc": created_utc,
         }
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-            for rel_path, data in sorted(ctx["loose_files"].items()):
-                zf.writestr(f"files/{rel_path}", data)
+            for rel_path, data in sorted(patched.items()):
+                zf.writestr(rel_path, data)
             zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
             zf.writestr("modinfo.json", json.dumps(modinfo, indent=2, ensure_ascii=False))
             zf.writestr("README.txt", self._readme_manager(ctx["mod_name"], ctx["translator"], ctx["version"], ctx["replace_name"], ctx["target_name"], ctx["replacement_count"], ctx["font_included"], ctx["game_build"]))
@@ -552,17 +574,73 @@ class ShipToAppDialog(QDialog):
             "INSTALL:\n  1. Extract ZIP\n  2. Run install.bat\n"
             f'  3. In-game select "{replace_name}" to see {target_name}\n\n'
             "UNINSTALL:\n  Run uninstall.bat (uses Steam Verify)\n\n"
-            "Generated by CrimsonForge\nhttps://github.com/hzeemr/crimsonforge\n"
+            "Generated by CrimsonForge\nhttps://github.com/MagestiUA/crimsonforge\n"
         )
 
     def _readme_manager(self, mod_name, translator, version, replace_name, target_name, count, font_included, game_build):
-        return (
+        header = (
             f"{mod_name}\n{'=' * len(mod_name)}\n\n"
             f"Translator: {translator}\nVersion: {version}\nGame Build: {game_build}\n"
             f"Translated: {count:,} entries\nFont: {'Included' if font_included else 'No'}\n\n"
-            "INSTALL\n  Import this ZIP into CDUMM, Crimson Browser, or another loose-file aware Crimson Desert mod manager.\n\n"
-            f'IN-GAME\n  Select "{replace_name}" to see {target_name}.\n\n'
-            "Generated by CrimsonForge\nhttps://github.com/hzeemr/crimsonforge\n"
+        )
+        if self._project.target_lang == "uk":
+            body = (
+                "ВСТАНОВЛЕННЯ (через Vortex -> DMM)\n"
+                "  1. Натисни кнопку завантаження через Vortex на сторінці Nexus (або встанови\n"
+                "     Vortex заздалегідь, якщо ще не встановлений)\n"
+                "  2. У Vortex обери гру Crimson Desert - Vortex запропонує встановити\n"
+                "     Definitive Mod Manager (DMM) для цієї гри\n"
+                "  3. Встанови DMM і запусти його (Vortex підкаже це зробити після завершення)\n"
+                "  4. У DMM вкажи шлях до папки гри (зазвичай визначається автоматично)\n"
+                "  5. Натисни Establish Baseline (одноразово, ~1 хв - чистий знімок файлів гри)\n"
+                "  6. Завантаж цей мод (через кнопку Nexus у DMM, або він підхопиться\n"
+                "     автоматично після Vortex-завантаження) і додай через Import\n"
+                "  7. Постав галочку на моді (Enabled) і натисни Mount Mods\n"
+                f'  8. Запусти гру, у Налаштування -> Мова встанови "{replace_name}"\n\n'
+                "  Щоб зняти мод: Revert to Vanilla у DMM.\n\n"
+                "ВСТАНОВЛЕННЯ ВРУЧНУ (без мод-менеджера)\n"
+                "  1. Розпакуй завантажений ZIP-архів\n"
+                "  2. Скопіюй усі папки з числовими назвами та папку meta з архіву прямо\n"
+                "     в папку гри (...\\Crimson Desert)\n"
+                "  3. Погодься на заміну файлів\n"
+                "  4. manifest.json, modinfo.json та README.txt не копіюй - вони не потрібні\n"
+                "     грі, це лише метадані для мод-менеджерів\n"
+                f'  5. Запусти гру, постав мову "{replace_name}"\n\n'
+                "  Щоб повернути оригінал: перевір цілісність файлів через Steam (клацни\n"
+                "  правою по грі -> Властивості -> Локальні файли -> Перевірити цілісність\n"
+                "  файлів гри).\n\n"
+            )
+        else:
+            body = (
+                "INSTALL (via Vortex -> DMM)\n"
+                "  1. Use the Vortex download button on the Nexus page (or install Vortex\n"
+                "     first if you don't have it)\n"
+                "  2. In Vortex, select Crimson Desert as the managed game - Vortex will\n"
+                "     prompt you to install Definitive Mod Manager (DMM) for this game\n"
+                "  3. Install DMM and launch it (Vortex will prompt this after install)\n"
+                "  4. In DMM, set the game folder path (usually auto-detected)\n"
+                "  5. Click Establish Baseline (one-time, ~1 min - a clean snapshot of your\n"
+                "     game files)\n"
+                "  6. Download this mod (via the Nexus button in DMM, or it will be picked\n"
+                "     up automatically after a Vortex download) and add it via Import\n"
+                "  7. Enable the mod's checkbox and click Mount Mods\n"
+                f'  8. Launch the game, set Settings -> Language to "{replace_name}"\n\n'
+                "  To remove: click Revert to Vanilla in DMM.\n\n"
+                "MANUAL INSTALL (no mod manager)\n"
+                "  1. Extract the downloaded ZIP\n"
+                "  2. Copy every numbered folder plus the meta folder from the archive\n"
+                "     straight into your game folder (...\\Crimson Desert)\n"
+                "  3. Confirm overwriting existing files\n"
+                "  4. Do NOT copy manifest.json, modinfo.json, or README.txt - the game\n"
+                "     doesn't need them, they're metadata for mod managers only\n"
+                f'  5. Launch the game, set the language to "{replace_name}"\n\n'
+                "  To restore the original: verify game file integrity through Steam\n"
+                "  (right-click the game -> Properties -> Local Files -> Verify integrity\n"
+                "  of game files).\n\n"
+            )
+        return (
+            header + body
+            + "Generated by CrimsonForge\nhttps://github.com/MagestiUA/crimsonforge\n"
         )
 
     def _detect_game_build(self, game_path):

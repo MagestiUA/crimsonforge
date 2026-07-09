@@ -26,7 +26,7 @@ This is an actively maintained continuation of [hzeemr/crimsonforge](https://git
 
 If you're looking for the original project and its full reverse-engineering history, go to [hzeemr/crimsonforge](https://github.com/hzeemr/crimsonforge) — all of that foundational work is still there, and this fork wouldn't exist without it.
 
-**Current version:** `1.28.0` — see [CHANGELOG.md](CHANGELOG.md) for this fork's changes, or the in-app **About** tab / `version.py` for the full history back to `v1.0`.
+**Current version:** `1.30.0` — see [CHANGELOG.md](CHANGELOG.md) for this fork's changes, or the in-app **About** tab / `version.py` for the full history back to `v1.0`.
 
 ## Main Features
 

@@ -7,6 +7,27 @@ This file tracks changes made in this fork on top of upstream
 full historical changelog for the base project (every version back to
 1.0) lives in `version.py` and is rendered in the app's **About** tab.
 
+## v1.30.0 — 2026-07-09
+
+### Ship to App fixes
+
+- **Manager ZIP package (CDUMM/DMM/Vortex) now actually works.** It was
+  writing raw, unencrypted, unencoded paloc data under a `files/` prefix
+  with no game-group folder - no mod manager could apply it. It now
+  shares the same PAZ/PAMT/PAPGT repacking logic as the Standalone ZIP
+  and writes the patched archives directly under their numbered
+  game-group folders at the ZIP root, matching CDUMM's documented
+  "Folders -> PAZ/PAMT files" format. Verified against a live DMM
+  install after the fix.
+- The bundled `README.txt` for Manager ZIP packages now documents the
+  real Vortex -> DMM install flow (establish baseline, import, mount)
+  plus a manual no-mod-manager install (copy the numbered folders
+  straight into the game directory), localized when the project's
+  target language is Ukrainian.
+- Fixed `generator_url` metadata and README credit links in shipped
+  packages (both translation and mesh mods) pointing at the upstream
+  repo instead of the fork that actually built them.
+
 ## v1.29.0 — 2026-07-05
 
 ### Parallel translation for high-concurrency providers
